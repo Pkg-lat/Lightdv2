@@ -130,9 +130,10 @@ impl ConsoleStreamer {
                 }
 
                 let attach_opts = AttachContainerOptions::<String> {
+                    // Ma4z caught this, the stderr and stdout were on false
                     stdin: Some(true),
-                    stdout: Some(false),
-                    stderr: Some(false),
+                    stdout: Some(true),
+                    stderr: Some(true),
                     stream: Some(true),
                     logs: Some(false),
                     ..Default::default()

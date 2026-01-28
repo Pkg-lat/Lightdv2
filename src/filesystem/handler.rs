@@ -1,5 +1,6 @@
 use super::volume::{Volume};
 use super::security;
+use super::quota::QuotaManager;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,13 +19,16 @@ use std::io::{Read, Seek};
 pub struct VolumeHandler {
     volumes: Arc<RwLock<Vec<Volume>>>,
     base_path: String,
+    quota_manager: Arc<QuotaManager>,
 }
 
 impl VolumeHandler {
     pub fn new(base_path: String) -> Self {
+        let quota_manager = Arc::new(QuotaManager::new(PathBuf::from(&base_path)));
         Self {
             volumes: Arc::new(RwLock::new(Vec::new())),
             base_path,
+            quota_manager,
         }
     }
 
@@ -37,6 +41,40 @@ impl VolumeHandler {
 
         tracing::info!("Volume created with ID: {}", volume.id);
         Ok(volume)
+    }
+    
+    pub async fn create_volume_with_quota(&self, size_mb: Option<u64>) -> Result<Volume, Box<dyn std::error::Error>> {
+        let quota_size = size_mb.unwrap_or(1024); // Default 1GB
+        let volume = Volume::new_with_quota(&self.base_path, quota_size)?;
+        
+        // Create volume with OS-level quota
+        let _path = self.quota_manager.create_volume_with_quota(&volume.id, Some(quota_size))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        
+        let mut volumes = self.volumes.write().await;
+        volumes.push(volume.clone());
+
+        tracing::info!("Volume created with ID: {} and {}MB quota", volume.id, quota_size);
+        Ok(volume)
+    }
+    
+    pub async fn get_volume_quota(&self, id: &str) -> Result<super::quota::DiskQuota, Box<dyn std::error::Error>> {
+        self.quota_manager.get_quota_usage(id)
+            .await
+            .map_err(|e| e.to_string().into())
+    }
+    
+    pub async fn check_volume_quota(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        self.quota_manager.check_quota_exceeded(id)
+            .await
+            .map_err(|e| e.to_string().into())
+    }
+    
+    pub async fn resize_volume(&self, id: &str, new_size_mb: u64) -> Result<(), Box<dyn std::error::Error>> {
+        self.quota_manager.resize_volume(id, new_size_mb)
+            .await
+            .map_err(|e| e.to_string().into())
     }
 
     pub async fn get_volume(&self, id: &str) -> Option<Volume> {
@@ -54,7 +92,16 @@ impl VolumeHandler {
         
         if let Some(pos) = volumes.iter().position(|v| v.id == id) {
             let volume = volumes.remove(pos);
-            tokio::fs::remove_dir_all(&volume.path).await?;
+            
+            // Delete with quota manager if volume has quota
+            if volume.quota_mb.is_some() {
+                self.quota_manager.delete_volume(id)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            } else {
+                tokio::fs::remove_dir_all(&volume.path).await?;
+            }
+            
             tracing::info!("Deleted volume: {}", id);
             Ok(())
         } else {

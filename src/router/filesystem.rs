@@ -21,6 +21,7 @@ struct VolumeResponse {
     id: String,
     path: String,
     created_at: u64,
+    quota_mb: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +96,24 @@ struct CompressResponse {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct CreateVolumeRequest {
+    size: Option<u64>, // Size in MB
+}
+
+#[derive(Serialize)]
+struct QuotaResponse {
+    size_mb: u64,
+    used_mb: u64,
+    available_mb: u64,
+    percentage_used: f64,
+}
+
+#[derive(Deserialize)]
+struct ResizeVolumeRequest {
+    size: u64, // New size in MB
+}
+
 pub fn volume_router(volume_handler: Arc<VolumeHandler>) -> Router {
     let state = AppState { volume_handler };
 
@@ -108,17 +127,29 @@ pub fn volume_router(volume_handler: Arc<VolumeHandler>) -> Router {
         .route("/volumes/:id/copy", post(copy_file_or_folder))
         .route("/volumes/:id/decompress", post(decompress_archive))
         .route("/volumes/:id/compress", post(compress_files))
+        .route("/volumes/:id/quota", get(get_volume_quota))
+        .route("/volumes/:id/resize", post(resize_volume))
         .with_state(state)
 }
 
 async fn create_volume(
     State(state): State<AppState>,
+    Json(payload): Json<Option<CreateVolumeRequest>>,
 ) -> Result<Json<VolumeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    match state.volume_handler.create_volume().await {
+    let size_mb = payload.and_then(|p| p.size);
+    
+    let result = if size_mb.is_some() {
+        state.volume_handler.create_volume_with_quota(size_mb).await
+    } else {
+        state.volume_handler.create_volume().await
+    };
+    
+    match result {
         Ok(volume) => Ok(Json(VolumeResponse {
             id: volume.id,
             path: volume.path.to_string_lossy().to_string(),
             created_at: volume.created_at,
+            quota_mb: volume.quota_mb,
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -139,6 +170,7 @@ async fn list_volumes(
             id: v.id,
             path: v.path.to_string_lossy().to_string(),
             created_at: v.created_at,
+            quota_mb: v.quota_mb,
         })
         .collect();
 
@@ -263,6 +295,50 @@ async fn compress_files(
             success: true,
             path: path.to_string_lossy().to_string(),
         })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn get_volume_quota(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<QuotaResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match state.volume_handler.get_volume_quota(&id).await {
+        Ok(quota) => {
+            let percentage_used = if quota.size_mb > 0 {
+                (quota.used_mb as f64 / quota.size_mb as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            Ok(Json(QuotaResponse {
+                size_mb: quota.size_mb,
+                used_mb: quota.used_mb,
+                available_mb: quota.available_mb,
+                percentage_used,
+            }))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn resize_volume(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ResizeVolumeRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    match state.volume_handler.resize_volume(&id, payload.size).await {
+        Ok(_) => Ok(StatusCode::OK),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

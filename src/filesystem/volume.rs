@@ -10,6 +10,7 @@ pub struct Volume {
     pub id: String,
     pub path: PathBuf,
     pub created_at: u64,
+    pub quota_mb: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +32,23 @@ impl Volume {
             id,
             path,
             created_at,
+            quota_mb: None,
+        })
+    }
+    
+    pub fn new_with_quota(base_path: &str, quota_mb: u64) -> Result<Self, Box<dyn std::error::Error>> {
+        let id = Uuid::new_v4().to_string();
+        let path = PathBuf::from(base_path).join(&id);
+        
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+
+        Ok(Self {
+            id,
+            path,
+            created_at,
+            quota_mb: Some(quota_mb),
         })
     }
 
