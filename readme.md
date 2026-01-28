@@ -1,8 +1,11 @@
 # Lightd v2
 
-A tribute to the only persn who's taught me on how to make daemons, Ma4z. Have a fun one mate!
+Thanks to
+**Ma4z for helping me out in debuggin**
+rishi.surf for general pointers
 
 A major revison of the original cluttered, cluster fuck of a system called Lightd.
 This version aims for a simpler, stateless remote based arch.
 
-Lightd brings a system called a distributed runtime. Where Lightd pulls containers 
+Docs available at - https://docs.pkg.lat/lightd/introduction
+A mirror what is used to write that is in /docs
