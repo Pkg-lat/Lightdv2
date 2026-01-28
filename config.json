@@ -1,0 +1,36 @@
+{
+  "version": "0.2.1",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8070
+  },
+  "authorization": {
+    "enabled": true,
+    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+  },
+  "docker": {
+    "socket_path": "/var/run/docker.sock"
+  },
+  "storage": {
+    "base_path": "/Users/nadhi/Desktop/Lightd-v2/storage",
+    "containers_path": "/Users/nadhi/Desktop/Lightd-v2/storage/containers",
+    "volumes_path": "/Users/nadhi/Desktop/Lightd-v2/storage/volumes"
+  },
+  "monitoring": {
+    "enabled": true,
+    "interval_ms": 1000,
+    "ru_config": {
+      "cpu_weight": 0.01,
+      "memory_weight": 0.02,
+      "io_weight": 0.00005,
+      "network_weight": 0.2,
+      "storage_weight": 0.2,
+      "base_ru": 0.001
+    }
+  },
+  "remote": {
+    "enabled": true,
+    "url": "https://your-remote-api.com/api",
+    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+  }
+}

@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lightd Console</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .header {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #58a6ff;
+        }
+        
+        .status-bar {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            font-size: 13px;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
+        }
+        
+        .status-dot.online { background: #3fb950; }
+        .status-dot.offline { background: #f85149; }
+        .status-dot.starting { background: #d29922; }
+        
+        .main {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        .sidebar {
+            width: 280px;
+            background: #161b22;
+            border-right: 1px solid #30363d;
+            padding: 16px;
+            overflow-y: auto;
+        }
+        
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .section {
+            margin-bottom: 24px;
+        }
+        
+        .section-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #8b949e;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+            letter-spacing: 0.5px;
+        }
+        
+        input {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #c9d1d9;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #58a6ff;
+        }
+        
+        button {
+            width: 100%;
+            padding: 8px 16px;
+            background: #238636;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+        }
+        
+        button:hover {
+            background: #2ea043;
+        }
+        
+        button:disabled {
+            background: #21262d;
+            color: #484f58;
+            cursor: not-allowed;
+        }
+        
+        button.danger {
+            background: #da3633;
+        }
+        
+        button.danger:hover {
+            background: #f85149;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        
+        .stat {
+            background: #0d1117;
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+        }
+        
+        .stat-label {
+            font-size: 11px;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+        
+        .stat-value {
+            font-size: 18px;
+            font-weight: 600;
+            color: #58a6ff;
+        }
+        
+        .console-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #0d1117;
+        }
+        
+        .console-header {
+            padding: 12px 16px;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .console-title {
+            font-size: 14px;
+            font-weight: 600;
+        }
+        
+        .console-actions button {
+            width: auto;
+            padding: 4px 12px;
+            font-size: 12px;
+            margin: 0 0 0 8px;
+        }
+        
+        .console {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        
+        .console-line {
+            margin-bottom: 2px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        
+        .console-line.info { color: #58a6ff; }
+        .console-line.success { color: #3fb950; }
+        .console-line.error { color: #f85149; }
+        .console-line.warn { color: #d29922; }
+        
+        .command-bar {
+            padding: 12px 16px;
+            background: #161b22;
+            border-top: 1px solid #30363d;
+            display: flex;
+            gap: 8px;
+        }
+        
+        .command-bar input {
+            margin: 0;
+        }
+        
+        .command-bar button {
+            width: auto;
+            margin: 0;
+            padding: 8px 20px;
+        }
+        
+        .power-controls {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .power-controls button {
+            flex: 1;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Lightd Console</h1>
+        <div class="status-bar">
+            <div>
+                <span class="status-dot offline" id="statusDot"></span>
+                <span id="statusText">Disconnected</span>
+            </div>
+            <div id="containerState" style="color: #8b949e;">-</div>
+        </div>
+    </div>
+    
+    <div class="main">
+        <div class="sidebar">
+            <div class="section">
+                <div class="section-title">Container Setup</div>
+                <input type="text" id="containerId" placeholder="Container ID" value="ws-test-001">
+                <input type="text" id="dockerImage" placeholder="Docker Image" value="alpine:latest">
+                <button onclick="createAndConnect()">Create & Connect</button>
+                <button onclick="deleteContainer()" class="danger">Delete Container</button>
+                <div style="margin-top: 12px; font-size: 12px; color: #8b949e;">
+                    Will run: <code style="background: #0d1117; padding: 2px 6px; border-radius: 3px;">while true; do echo "Hello mate"; sleep 1; done</code>
+                </div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">Power</div>
+                <div class="power-controls">
+                    <button onclick="power('start')">Start</button>
+                    <button onclick="power('kill')" class="danger">Kill</button>
+                </div>
+                <button onclick="power('restart')">Restart</button>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">Stats</div>
+                <div class="stats">
+                    <div class="stat">
+                        <div class="stat-label">CPU</div>
+                        <div class="stat-value" id="cpu">0%</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Memory</div>
+                        <div class="stat-value" id="mem">0MB</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Net RX</div>
+                        <div class="stat-value" id="rx">0KB</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Net TX</div>
+                        <div class="stat-value" id="tx">0KB</div>
+                    </div>
+                </div>
+                <div class="stat">
+                    <div class="stat-label">Uptime</div>
+                    <div class="stat-value" id="uptime">0s</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="content">
+            <div class="console-container">
+                <div class="console-header">
+                    <div class="console-title">Console Output</div>
+                    <div class="console-actions">
+                        <button onclick="clearConsole()">Clear</button>
+                    </div>
+                </div>
+                <div class="console" id="console"></div>
+                <div class="command-bar">
+                    <input type="text" id="cmd" placeholder="Enter command..." onkeypress="if(event.key==='Enter')sendCmd()">
+                    <button onclick="sendCmd()">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const BASE = 'http://localhost:8070';
+        let ws = null;
+        let containerId = null;
+        
+        async function createAndConnect() {
+            containerId = document.getElementById('containerId').value;
+            const image = document.getElementById('dockerImage').value;
+            
+            log('Creating volume...', 'info');
+            
+            try {
+                const volRes = await fetch(`${BASE}/volumes`, { method: 'POST' });
+                const vol = await volRes.json();
+                
+                log(`Volume: ${vol.id}`, 'success');
+                
+                const res = await fetch(`${BASE}/containers`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        internal_id: containerId,
+                        volume_id: vol.id,
+                        startup_command: 'while true; do echo "Hello mate"; sleep 1; done',
+                        image: image,
+                        start_pattern: 'Hello mate'
+                    })
+                });
+                
+                const data = await res.json();
+                log(`Container created: ${data.internal_id}`, 'success');
+                log('Installing... connecting WebSocket...', 'info');
+                
+                // Auto-connect
+                setTimeout(() => connect(), 1000);
+                
+            } catch (e) {
+                log(`Error: ${e.message}`, 'error');
+            }
+        }
+        
+        async function deleteContainer() {
+            if (!containerId) return;
+            try {
+                await fetch(`${BASE}/containers/${containerId}`, { method: 'DELETE' });
+                log('Container deleted', 'success');
+                if (ws) ws.close();
+            } catch (e) {
+                log(`Error: ${e.message}`, 'error');
+            }
+        }
+        
+        function connect() {
+            if (!containerId) {
+                log('No container ID', 'error');
+                return;
+            }
+            
+            if (ws) ws.close();
+            
+            ws = new WebSocket(`ws://localhost:8070/ws/${containerId}`);
+            
+            ws.onopen = () => {
+                updateStatus('online', 'Connected');
+                log('WebSocket connected', 'success');
+            };
+            
+            ws.onclose = () => {
+                updateStatus('offline', 'Disconnected');
+                log('WebSocket closed', 'warn');
+            };
+            
+            ws.onerror = () => {
+                log('WebSocket error', 'error');
+            };
+            
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                
+                if (data.console) {
+                    log(data.console);
+                }
+                
+                if (data.stats) {
+                    const s = data.stats;
+                    document.getElementById('cpu').textContent = `${s.cpu_absolute.toFixed(1)}%`;
+                    document.getElementById('mem').textContent = `${(s.memory_bytes/1024/1024).toFixed(0)}MB`;
+                    document.getElementById('rx').textContent = `${(s.network.rx_bytes/1024).toFixed(0)}KB`;
+                    document.getElementById('tx').textContent = `${(s.network.tx_bytes/1024).toFixed(0)}KB`;
+                    document.getElementById('uptime').textContent = formatTime(s.uptime);
+                    document.getElementById('containerState').textContent = s.state;
+                    
+                    // Update status dot based on state
+                    if (s.state === 'running') {
+                        document.getElementById('statusDot').className = 'status-dot online';
+                    } else if (s.state === 'starting') {
+                        document.getElementById('statusDot').className = 'status-dot starting';
+                    } else {
+                        document.getElementById('statusDot').className = 'status-dot offline';
+                    }
+                }
+                
+                if (data.event) {
+                    log(`[${data.event}]`, 'info');
+                    document.getElementById('containerState').textContent = data.event;
+                }
+                
+                if (data.daemon_message) {
+                    log(`[DAEMON] ${data.daemon_message}`, 'info');
+                }
+            };
+        }
+        
+        function power(action) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('Not connected', 'error');
+                return;
+            }
+            ws.send(JSON.stringify({ power: [action] }));
+            log(`Power: ${action}`, 'info');
+        }
+        
+        function sendCmd() {
+            const input = document.getElementById('cmd');
+            const cmd = input.value.trim();
+            if (!cmd) return;
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('Not connected', 'error');
+                return;
+            }
+            
+            ws.send(JSON.stringify({ send_command: [cmd] }));
+            log(`$ ${cmd}`, 'info');
+            input.value = '';
+        }
+        
+        function log(text, type = '') {
+            const console = document.getElementById('console');
+            const line = document.createElement('div');
+            line.className = `console-line ${type}`;
+            line.textContent = text;
+            console.appendChild(line);
+            console.scrollTop = console.scrollHeight;
+        }
+        
+        function clearConsole() {
+            document.getElementById('console').innerHTML = '';
+        }
+        
+        function updateStatus(status, text) {
+            document.getElementById('statusDot').className = `status-dot ${status}`;
+            document.getElementById('statusText').textContent = text;
+        }
+        
+        function formatTime(s) {
+            if (s < 60) return `${s}s`;
+            if (s < 3600) return `${Math.floor(s/60)}m`;
+            return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+        }
+    </script>
+</body>
+</html>
