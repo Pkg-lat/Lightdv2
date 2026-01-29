@@ -55,6 +55,8 @@ pub struct BillingTracker {
     rates: Arc<RwLock<BillingRates>>,
     usage_data: Arc<RwLock<HashMap<String, Vec<ResourceUsage>>>>,
     interval_ms: u64,
+    remote_sync: Option<Arc<crate::remote::client::RemoteSyncManager>>,
+    container_manager: Option<Arc<crate::container::manager::ContainerManager>>,
 }
 
 impl BillingTracker {
@@ -66,11 +68,25 @@ impl BillingTracker {
             rates: Arc::new(RwLock::new(rates)),
             usage_data: Arc::new(RwLock::new(HashMap::new())),
             interval_ms,
+            remote_sync: None,
+            container_manager: None,
         })
     }
     
+    /// Set remote sync manager for billing updates
+    pub fn with_remote_sync(mut self, remote_sync: Arc<crate::remote::client::RemoteSyncManager>) -> Self {
+        self.remote_sync = Some(remote_sync);
+        self
+    }
+    
+    /// Set container manager for internal ID mapping
+    pub fn with_container_manager(mut self, manager: Arc<crate::container::manager::ContainerManager>) -> Self {
+        self.container_manager = Some(manager);
+        self
+    }
+    
     /// Start monitoring all containers
-    pub async fn start_monitoring(self: Arc<Self>) {
+    pub fn start_monitoring(self: Arc<Self>) {
         let tracker = self.clone();
         
         tokio::spawn(async move {
@@ -106,7 +122,72 @@ impl BillingTracker {
             }
         }
         
+        // Send billing updates to remote if configured
+        if let Some(ref remote_sync) = self.remote_sync {
+            self.sync_billing_to_remote(remote_sync).await;
+        }
+        
         Ok(())
+    }
+    
+    /// Sync billing data to remote server
+    async fn sync_billing_to_remote(&self, remote_sync: &Arc<crate::remote::client::RemoteSyncManager>) {
+        let tracked = self.get_tracked_containers().await;
+        
+        // Need container manager to map Docker IDs to internal IDs
+        let manager = match &self.container_manager {
+            Some(m) => m,
+            None => {
+                tracing::warn!("Container manager not set, cannot sync billing to remote");
+                return;
+            }
+        };
+        
+        for docker_container_id in tracked {
+            // Get all containers and find matching internal_id
+            let containers = match manager.list_containers().await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to list containers for billing sync: {}", e);
+                    continue;
+                }
+            };
+            
+            // Find container with matching Docker ID
+            let internal_id = containers.iter()
+                .find(|c| c.container_id.as_ref() == Some(&docker_container_id))
+                .map(|c| c.internal_id.clone());
+            
+            let internal_id = match internal_id {
+                Some(id) => id,
+                None => {
+                    tracing::debug!("No internal_id found for Docker container: {}", docker_container_id);
+                    continue;
+                }
+            };
+            
+            // Get hourly usage snapshot
+            match self.get_usage_snapshot(&docker_container_id, 1.0).await {
+                Ok(snapshot) => {
+                    let cost = self.calculate_cost(&snapshot).await;
+                    
+                    remote_sync.notify_billing(
+                        internal_id,
+                        snapshot.memory_gb,
+                        snapshot.cpu_vcpus,
+                        snapshot.storage_gb,
+                        snapshot.egress_gb,
+                        snapshot.duration_hours,
+                        cost,
+                    );
+                    
+                    tracing::debug!("Sent billing update to remote for container: {}", docker_container_id);
+                }
+                Err(e) => {
+                    tracing::debug!("No billing data to sync for {}: {}", docker_container_id, e);
+                }
+            }
+        }
     }
     
     /// Collect metrics for a specific container

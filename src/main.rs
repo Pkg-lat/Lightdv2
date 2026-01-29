@@ -77,24 +77,13 @@ async fn main_app(timer: Timer) {
     let config = config::config::Config::load("config.json")
         .expect("Failed to load config");
     
-    // Initialize billing tracker
+    // Initialize billing rates for later use
     let billing_rates = billing::tracker::BillingRates {
         memory_per_gb_hour: config.monitoring.billing.memory_per_gb_hour,
         cpu_per_vcpu_hour: config.monitoring.billing.cpu_per_vcpu_hour,
         storage_per_gb_hour: config.monitoring.billing.storage_per_gb_hour,
         egress_per_gb: config.monitoring.billing.egress_per_gb,
     };
-    
-    let billing_tracker = Arc::new(billing::tracker::BillingTracker::new(
-        billing_rates,
-        config.monitoring.interval_ms,
-    ).expect("Failed to initialize billing tracker"));
-    
-    // Start billing monitoring if enabled
-    if config.monitoring.enabled {
-        billing_tracker.clone().start_monitoring().await;
-        tracing::info!("Billing monitoring started");
-    }
     
     // Initialize token manager
     let tokens_db_path = format!("{}/tokens.db", config.storage.base_path);
@@ -158,6 +147,51 @@ async fn main_app(timer: Timer) {
     let container_manager = Arc::new(container::manager::ContainerManager::new(&containers_db_path)
         .expect("Failed to initialize container manager"));
     
+    // Initialize remote sync manager if enabled (before billing tracker)
+    let remote_sync = if let Some(remote_config) = &config.remote {
+        if remote_config.enabled {
+            let sync_manager = Arc::new(remote::client::RemoteSyncManager::new(
+                remote_config.url.clone(),
+                remote_config.token.clone(),
+            ));
+            
+            // Start health check loop (non-blocking)
+            sync_manager.start_health_check();
+            
+            tracing::info!("Remote sync enabled: {}", remote_config.url);
+            Some(sync_manager)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    // Initialize billing tracker with remote sync and container manager
+    let billing_tracker = {
+        let mut tracker = billing::tracker::BillingTracker::new(
+            billing_rates,
+            config.monitoring.interval_ms,
+        ).expect("Failed to initialize billing tracker");
+        
+        // Add container manager for internal ID mapping
+        tracker = tracker.with_container_manager(container_manager.clone());
+        
+        // Add remote sync if enabled
+        if let Some(ref remote) = remote_sync {
+            tracker = tracker.with_remote_sync(remote.clone());
+            tracing::info!("Billing tracker configured with remote sync");
+        }
+        
+        Arc::new(tracker)
+    };
+    
+    // Start billing monitoring if enabled
+    if config.monitoring.enabled {
+        billing_tracker.clone().start_monitoring();
+        tracing::info!("Billing monitoring started");
+    }
+    
     // Initialize lifecycle manager with event channel
     let (lifecycle_manager, mut lifecycle_rx) = container::lifecycle::LifecycleManager::new(container_manager.clone())
         .expect("Failed to initialize lifecycle manager");
@@ -193,35 +227,22 @@ async fn main_app(timer: Timer) {
         event_hub.clone(),
     ).expect("Failed to initialize stats collector"));
     
-    // Initialize remote sync manager if enabled
-    let remote_sync = if let Some(remote_config) = &config.remote {
-        if remote_config.enabled {
-            let sync_manager = Arc::new(remote::client::RemoteSyncManager::new(
-                remote_config.url.clone(),
-                remote_config.token.clone(),
-            ));
-            
-            // Start health check loop
-            sync_manager.start_health_check().await;
-            
-            tracing::info!("Remote sync enabled: {}", remote_config.url);
-            Some(sync_manager)
-        } else {
-            None
+    tracing::info!("Checking Docker availability");
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        lifecycle_manager.check_docker()
+    ).await {
+        Ok(Ok(())) => {
+            tracing::info!("Docker daemon ready");
         }
-    } else {
-        None
-    };
-    
-    // Check Docker availability at startup
-    match lifecycle_manager.check_docker().await {
-        Ok(()) => {
-           // println!("✓ Docker daemon is running and accessible");
-           // We know alr!
+        Ok(Err(e)) => {
+            eprintln!("Docker error: {}", e);
+            eprintln!("Please ensure Docker Desktop is running");
+            return;
         }
-        Err(e) => {
-            eprintln!("✗ Docker Error: {}", e);
-            eprintln!("  Please ensure Docker Desktop is running and try again.");
+        Err(_) => {
+            eprintln!("Docker check timeout");
+            eprintln!("Please ensure Docker Desktop is running");
             return;
         }
     }
@@ -233,11 +254,13 @@ async fn main_app(timer: Timer) {
     // Spawn lifecycle event listener
     tokio::spawn(async move {
         while let Some(event) = lifecycle_rx.recv().await {
-            if let container::lifecycle::LifecycleEvent::DockerConnected = event {
-                // So many logs about the docker daemon
-                // just end it from here and send nothing
-            }else {
-                tracing::info!("Container lifecycle event: {:?}", event);
+            match &event {
+                container::lifecycle::LifecycleEvent::DockerConnected => {
+                    // Skip logging
+                }
+                _ => {
+                    tracing::info!("Container lifecycle event: {:?}", event);
+                }
             }
             
             // Send status updates to remote if enabled
@@ -245,6 +268,12 @@ async fn main_app(timer: Timer) {
                 match &event {
                     container::lifecycle::LifecycleEvent::Started(id) => {
                         sync.notify_status(id.clone(), "installing".to_string());
+                    }
+                    container::lifecycle::LifecycleEvent::PullingImage(id, image) => {
+                        event_hub_lifecycle.broadcast_daemon_message(id, &format!("Pulling image: {}", image)).await;
+                    }
+                    container::lifecycle::LifecycleEvent::ImagePulled(id, image) => {
+                        event_hub_lifecycle.broadcast_daemon_message(id, &format!("Image pulled: {}", image)).await;
                     }
                     container::lifecycle::LifecycleEvent::CreatingContainer(id) => {
                         sync.notify_status(id.clone(), "installing".to_string());
@@ -264,6 +293,9 @@ async fn main_app(timer: Timer) {
             
             // Broadcast relevant events to WebSocket clients
             match &event {
+                container::lifecycle::LifecycleEvent::PullingImage(id, _) => {
+                    websocket::notify_installing(&event_hub_lifecycle, id).await;
+                }
                 container::lifecycle::LifecycleEvent::CreatingContainer(id) => {
                     websocket::notify_installing(&event_hub_lifecycle, id).await;
                 }

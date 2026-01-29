@@ -19,6 +19,17 @@ pub enum RemoteEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         data: Option<String>,
     },
+    #[serde(rename = "billing")]
+    Billing {
+        server: String,
+        memory_gb: f64,
+        cpu_vcpus: f64,
+        storage_gb: f64,
+        egress_gb: f64,
+        duration_hours: f64,
+        estimated_cost: f64,
+        timestamp: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +105,36 @@ impl RemoteClient {
             status: None,
             error: Some(error.to_string()),
             data,
+        };
+        
+        self.send_event(event).await
+    }
+    
+    /// Send billing usage update to remote
+    pub async fn send_billing_update(
+        &self,
+        internal_id: &str,
+        memory_gb: f64,
+        cpu_vcpus: f64,
+        storage_gb: f64,
+        egress_gb: f64,
+        duration_hours: f64,
+        estimated_cost: f64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let event = RemoteEvent::Billing {
+            server: internal_id.to_string(),
+            memory_gb,
+            cpu_vcpus,
+            storage_gb,
+            egress_gb,
+            duration_hours,
+            estimated_cost,
+            timestamp,
         };
         
         self.send_event(event).await
@@ -178,7 +219,7 @@ impl RemoteSyncManager {
     }
     
     /// Start health check loop
-    pub async fn start_health_check(&self) {
+    pub fn start_health_check(&self) {
         let client = self.client.clone();
         
         tokio::spawn(async move {
@@ -219,6 +260,34 @@ impl RemoteSyncManager {
         tokio::spawn(async move {
             if let Err(e) = client.send_error_update(&internal_id, &error, data).await {
                 tracing::error!("Failed to send error update to remote: {}", e);
+            }
+        });
+    }
+    
+    /// Send billing usage update (non-blocking)
+    pub fn notify_billing(
+        &self,
+        internal_id: String,
+        memory_gb: f64,
+        cpu_vcpus: f64,
+        storage_gb: f64,
+        egress_gb: f64,
+        duration_hours: f64,
+        estimated_cost: f64,
+    ) {
+        let client = self.client.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = client.send_billing_update(
+                &internal_id,
+                memory_gb,
+                cpu_vcpus,
+                storage_gb,
+                egress_gb,
+                duration_hours,
+                estimated_cost,
+            ).await {
+                tracing::error!("Remote: {}", e);
             }
         });
     }

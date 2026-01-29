@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 pub enum LifecycleEvent {
     Started(String),
     DockerConnected,
+    PullingImage(String, String),
+    ImagePulled(String, String),
     CreatingContainer(String),
     ContainerCreated(String, String),
     RunningInstallScript(String),
@@ -22,10 +24,8 @@ pub enum LifecycleEvent {
     SettingUpEntrypoint(String),
     Ready(String),
     Error(String, String),
-    // Reinstall events
     ReinstallStarted(String),
     RemovingOldContainer(String),
-    // Repair events
     RepairStarted(String),
     CorruptionDetected(String, String),
 }
@@ -66,18 +66,92 @@ impl LifecycleManager {
 
     /// Verify Docker daemon is running and accessible
     pub async fn check_docker(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match self.docker.ping().await {
-            Ok(_) => {
+        let ping_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            self.docker.ping()
+        ).await;
+        
+        match ping_result {
+            Ok(Ok(_)) => {
                 let _ = self.event_tx.send(LifecycleEvent::DockerConnected);
-                tracing::info!("Docker marked as accessible and ready.");
+                tracing::info!("Docker daemon accessible");
                 Ok(())
             }
-            Err(e) => {
-                let error_msg = format!("Docker daemon is not accessible: {}. Please ensure Docker is running u muppet!", e);
+            Ok(Err(e)) => {
+                let error_msg = format!("Docker daemon not accessible: {}", e);
+                tracing::error!("{}", error_msg);
+                Err(error_msg.into())
+            }
+            Err(_) => {
+                let error_msg = "Docker ping timeout after 5 seconds";
                 tracing::error!("{}", error_msg);
                 Err(error_msg.into())
             }
         }
+    }
+
+    /// Ensure Docker image is available, pull if necessary
+    async fn ensure_image_available(
+        docker: &Docker,
+        image: &str,
+        internal_id: &str,
+        event_tx: &mpsc::UnboundedSender<LifecycleEvent>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use bollard::image::CreateImageOptions;
+        
+        // Check if image exists
+        match docker.inspect_image(image).await {
+            Ok(_) => {
+                tracing::debug!("Image {} already available", image);
+                return Ok(());
+            }
+            Err(e) => {
+                if !e.to_string().contains("404") && !e.to_string().contains("No such image") {
+                    return Err(e.into());
+                }
+            }
+        }
+        
+        // Image not found, pull it
+        let _ = event_tx.send(LifecycleEvent::PullingImage(
+            internal_id.to_string(),
+            image.to_string(),
+        ));
+        
+        tracing::info!("Pulling image: {}", image);
+        
+        let options = Some(CreateImageOptions {
+            from_image: image,
+            ..Default::default()
+        });
+        
+        let mut stream = docker.create_image(options, None, None);
+        
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(info) => {
+                    if let Some(status) = info.status {
+                        tracing::info!("[{}] Image pull: {}", internal_id, status);
+                    }
+                    if let Some(progress) = info.progress {
+                        tracing::debug!("[{}] {}", internal_id, progress);
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Image pull failed: {}", e);
+                    tracing::error!("{}", error_msg);
+                    return Err(error_msg.into());
+                }
+            }
+        }
+        
+        let _ = event_tx.send(LifecycleEvent::ImagePulled(
+            internal_id.to_string(),
+            image.to_string(),
+        ));
+        
+        tracing::info!("Image {} pulled successfully", image);
+        Ok(())
     }
 
     pub async fn install_container(
@@ -180,6 +254,16 @@ impl LifecycleManager {
         }
 
         let _ = event_tx.send(LifecycleEvent::CreatingContainer(internal_id.clone()));
+
+        // Ensure image is available
+        if let Err(e) = Self::ensure_image_available(
+            &docker,
+            &image,
+            &internal_id,
+            &event_tx,
+        ).await {
+            return Err(format!("Failed to pull image: {}", e).into());
+        }
 
         // Create container config
         let mut host_config = HostConfig {
