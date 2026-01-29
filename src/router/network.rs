@@ -32,6 +32,23 @@ struct BulkDeleteRequest {
     ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct BulkAddRequest {
+    ports: Vec<BulkAddPort>,
+}
+
+#[derive(Deserialize)]
+struct BulkAddPort {
+    ip: String,
+    port: u16,
+    #[serde(default = "default_protocol")]
+    protocol: String,
+}
+
+fn default_protocol() -> String {
+    "tcp".to_string()
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
@@ -42,12 +59,20 @@ struct BulkDeleteResponse {
     deleted: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct BulkAddResponse {
+    added: Vec<NetworkPort>,
+    count: usize,
+}
+
 pub fn network_router(pool: Arc<NetworkPool>) -> Router {
     let state = NetworkState { pool };
 
     Router::new()
         .route("/network/ports", post(add_port))
         .route("/network/ports", get(get_all_ports))
+        .route("/network/ports/bulk", post(bulk_add))
+        .route("/network/ports/available", get(get_available_ports))
         .route("/network/ports/random", get(get_random_port))
         .route("/network/ports/:id", get(get_port))
         .route("/network/ports/:id", delete(delete_port))
@@ -176,4 +201,51 @@ async fn bulk_delete(
                 }),
             )
         })
+}
+
+#[axum::debug_handler]
+async fn bulk_add(
+    State(state): State<NetworkState>,
+    Json(payload): Json<BulkAddRequest>,
+) -> Result<Json<BulkAddResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if payload.ports.len() > 50 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Maximum 50 ports allowed per bulk add".to_string(),
+            }),
+        ));
+    }
+
+    let ports_to_add: Vec<(String, u16, String)> = payload.ports
+        .into_iter()
+        .map(|p| (p.ip, p.port, p.protocol))
+        .collect();
+
+    match state.pool.bulk_add(ports_to_add).await {
+        Ok(added) => {
+            let count = added.len();
+            Ok(Json(BulkAddResponse { added, count }))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn get_available_ports(
+    State(state): State<NetworkState>,
+) -> Result<Json<Vec<NetworkPort>>, (StatusCode, Json<ErrorResponse>)> {
+    match state.pool.get_available_ports().await {
+        Ok(ports) => Ok(Json(ports)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
 }

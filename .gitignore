@@ -3,3 +3,9 @@
 /docs
 /storage
 storage
+docs
+/docs/*
+/storage-old
+storage-old
+/Lightd
+Lightd

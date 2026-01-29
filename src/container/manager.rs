@@ -258,4 +258,56 @@ impl ContainerManager {
             Err("Container not found".into())
         }
     }
+
+    /// Update resource limits for a container
+    pub async fn update_limits(
+        &self,
+        internal_id: &str,
+        limits: super::update::ResourceLimits,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _lock = self.states.write().await;
+
+        if let Some(mut state) = self.get_container(internal_id).await? {
+            // Update limits in state
+            if let Some(memory) = limits.memory {
+                state.limits.memory = Some(memory);
+            }
+            if let Some(cpu) = limits.cpu_shares {
+                // Convert CPU shares to CPU cores (approximate)
+                state.limits.cpu = Some(cpu as f64 / 1024.0);
+            }
+            
+            state.update_timestamp();
+
+            let serialized = serde_json::to_vec(&state)?;
+            self.db.insert(internal_id.as_bytes(), serialized)?;
+
+            tracing::info!("Updated resource limits for container {}", internal_id);
+            Ok(())
+        } else {
+            Err("Container not found".into())
+        }
+    }
+
+    /// Update volume mounts for a container
+    pub async fn update_volumes(
+        &self,
+        internal_id: &str,
+        volumes: std::collections::HashMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _lock = self.states.write().await;
+
+        if let Some(mut state) = self.get_container(internal_id).await? {
+            state.mount = volumes;
+            state.update_timestamp();
+
+            let serialized = serde_json::to_vec(&state)?;
+            self.db.insert(internal_id.as_bytes(), serialized)?;
+
+            tracing::info!("Updated volumes for container {}", internal_id);
+            Ok(())
+        } else {
+            Err("Container not found".into())
+        }
+    }
 }

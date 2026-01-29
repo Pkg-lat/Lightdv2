@@ -9,6 +9,7 @@ mod websocket;
 mod auth;
 mod cli;
 mod remote;
+mod billing;
 
 use axum::routing::get;
 use axum::Router;
@@ -76,6 +77,25 @@ async fn main_app(timer: Timer) {
     let config = config::config::Config::load("config.json")
         .expect("Failed to load config");
     
+    // Initialize billing tracker
+    let billing_rates = billing::tracker::BillingRates {
+        memory_per_gb_hour: config.monitoring.billing.memory_per_gb_hour,
+        cpu_per_vcpu_hour: config.monitoring.billing.cpu_per_vcpu_hour,
+        storage_per_gb_hour: config.monitoring.billing.storage_per_gb_hour,
+        egress_per_gb: config.monitoring.billing.egress_per_gb,
+    };
+    
+    let billing_tracker = Arc::new(billing::tracker::BillingTracker::new(
+        billing_rates,
+        config.monitoring.interval_ms,
+    ).expect("Failed to initialize billing tracker"));
+    
+    // Start billing monitoring if enabled
+    if config.monitoring.enabled {
+        billing_tracker.clone().start_monitoring().await;
+        tracing::info!("Billing monitoring started");
+    }
+    
     // Initialize token manager
     let tokens_db_path = format!("{}/tokens.db", config.storage.base_path);
     let token_manager = Arc::new(auth::tokens::TokenManager::new(&tokens_db_path)
@@ -101,6 +121,33 @@ async fn main_app(timer: Timer) {
     let network_pool = Arc::new(network::pool::NetworkPool::new(&network_db_path)
         .expect("Failed to initialize network pool"));
     
+    // Initialize default ports (25565-25569) on first startup
+    let default_ports = vec![
+        ("0.0.0.0".to_string(), 25565, "tcp".to_string()),
+        ("0.0.0.0".to_string(), 25566, "tcp".to_string()),
+        ("0.0.0.0".to_string(), 25567, "tcp".to_string()),
+        ("0.0.0.0".to_string(), 25568, "tcp".to_string()),
+        ("0.0.0.0".to_string(), 25569, "tcp".to_string()),
+    ];
+    
+    // Check if pool is empty and add default ports
+    match network_pool.get_all_ports().await {
+        Ok(ports) if ports.is_empty() => {
+            tracing::info!("Initializing default port pool (25565-25569)");
+            for (ip, port, protocol) in default_ports {
+                if let Err(e) = network_pool.add_port(ip.clone(), port, Some(protocol.clone())).await {
+                    tracing::error!("Failed to add default port {}: {}", port, e);
+                }
+            }
+        }
+        Ok(ports) => {
+            tracing::info!("Network pool initialized with {} ports", ports.len());
+        }
+        Err(e) => {
+            tracing::error!("Failed to check network pool: {}", e);
+        }
+    }
+    
     // Initialize firewall manager
     let firewall_db_path = format!("{}/firewall.db", config.storage.base_path);
     let firewall_manager = Arc::new(network::firewall::FirewallManager::new(&firewall_db_path)
@@ -120,6 +167,11 @@ async fn main_app(timer: Timer) {
     let (power_manager, mut power_rx) = container::power::PowerManager::new(container_manager.clone())
         .expect("Failed to initialize power manager");
     let power_manager = Arc::new(power_manager);
+    
+    // Initialize container updater with event channel
+    let (container_updater, mut update_rx) = container::update::ContainerUpdater::new(container_manager.clone())
+        .expect("Failed to initialize container updater");
+    let _container_updater = Arc::new(container_updater);
     
     // Initialize network rebinder with event channel
     let (network_rebinder, mut network_rx) = container::network::NetworkRebinder::new(container_manager.clone())
@@ -272,6 +324,13 @@ async fn main_app(timer: Timer) {
         }
     });
     
+    // Spawn container update event listener
+    tokio::spawn(async move {
+        while let Some(event) = update_rx.recv().await {
+            tracing::info!("Container update event: {:?}", event);
+        }
+    });
+    
     // Setup WebSocket state
     let ws_state = websocket::WebSocketState {
         manager: container_manager.clone(),
@@ -287,6 +346,7 @@ async fn main_app(timer: Timer) {
     let auth_routes = router::auth::auth_router(token_manager);
     let remote_routes = router::remote::remote_router();
     let firewall_routes = router::firewall::firewall_router(firewall_manager);
+    let billing_routes = router::billing::billing_router(billing_tracker);
     
     // Create auth config for middleware
     let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config));
@@ -294,11 +354,13 @@ async fn main_app(timer: Timer) {
     // Protected routes with auth middleware
     let filesystem_routes = router::filesystem::volume_router(volume_handler)
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
-    let network_routes = router::network::network_router(network_pool)
+    let network_routes = router::network::network_router(network_pool.clone())
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let firewall_protected_routes = firewall_routes
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
-    let container_routes = router::container::container_router(container_manager, lifecycle_manager, power_manager, network_rebinder)
+    let billing_protected_routes = billing_routes
+        .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+    let container_routes = router::container::container_router(container_manager, lifecycle_manager, power_manager, network_rebinder, network_pool)
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     
     // WebSocket route
@@ -313,6 +375,7 @@ async fn main_app(timer: Timer) {
         .merge(filesystem_routes)
         .merge(network_routes)
         .merge(firewall_protected_routes)
+        .merge(billing_protected_routes)
         .merge(container_routes)
         .merge(ws_routes)
         .layer(

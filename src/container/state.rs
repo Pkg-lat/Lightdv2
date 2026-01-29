@@ -28,8 +28,8 @@ pub struct ContainerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortBinding {
-    pub ip: String,
-    pub port: u16,
+    pub container_port: u16,
+    pub host_port: u16,
     pub protocol: String,
 }
 

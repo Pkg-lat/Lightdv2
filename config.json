@@ -19,13 +19,11 @@
   "monitoring": {
     "enabled": true,
     "interval_ms": 1000,
-    "ru_config": {
-      "cpu_weight": 0.01,
-      "memory_weight": 0.02,
-      "io_weight": 0.00005,
-      "network_weight": 0.2,
-      "storage_weight": 0.2,
-      "base_ru": 0.001
+    "billing": {
+      "memory_per_gb_hour": 0.01,
+      "cpu_per_vcpu_hour": 0.02,
+      "storage_per_gb_hour": 0.0001,
+      "egress_per_gb": 0.05
     }
   },
   "remote": {

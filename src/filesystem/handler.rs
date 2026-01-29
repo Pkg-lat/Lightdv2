@@ -1,6 +1,7 @@
 use super::volume::{Volume};
 use super::security;
 use super::quota::QuotaManager;
+use super::fileinfo::{FileObject, list_directory_detailed};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -65,6 +66,7 @@ impl VolumeHandler {
             .map_err(|e| e.to_string().into())
     }
     
+    #[allow(dead_code)]
     pub async fn check_volume_quota(&self, id: &str) -> Result<bool, Box<dyn std::error::Error>> {
         self.quota_manager.check_quota_exceeded(id)
             .await
@@ -112,6 +114,28 @@ impl VolumeHandler {
     pub async fn list_volume_files(&self, id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         if let Some(volume) = self.get_volume(id).await {
             volume.list_files().await
+        } else {
+            Err("Volume not found".into())
+        }
+    }
+    
+    pub async fn list_volume_files_detailed(&self, id: &str, path: Option<&str>) -> Result<Vec<FileObject>, Box<dyn std::error::Error>> {
+        if let Some(volume) = self.get_volume(id).await {
+            let target_path = if let Some(p) = path {
+                volume.get_path().join(p.trim_start_matches('/'))
+            } else {
+                volume.get_path().to_path_buf()
+            };
+            
+            // Validate path is within volume
+            let canonical = target_path.canonicalize()?;
+            let volume_canonical = volume.get_path().canonicalize()?;
+            
+            if !canonical.starts_with(&volume_canonical) {
+                return Err("Path traversal detected".into());
+            }
+            
+            list_directory_detailed(&target_path).await.map_err(|e| e.to_string().into())
         } else {
             Err("Volume not found".into())
         }

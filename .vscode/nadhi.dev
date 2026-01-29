@@ -1,0 +1,13 @@
+{
+    _note: Automatically generated for nadhi.dev projects
+    schema: {
+        notes
+        src 
+        storage
+        tests
+    }
+    lang: Rust 
+    src: {
+        main: src/main.rs
+    }
+}

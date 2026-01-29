@@ -13,6 +13,8 @@ use crate::container::manager::ContainerManager;
 use crate::container::power::{PowerManager, PowerAction};
 use crate::container::network::NetworkRebinder;
 use crate::container::state::{InstallState, PortBinding};
+use crate::container::update::{ContainerUpdater, ResourceLimits};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct ContainerAppState {
@@ -20,6 +22,7 @@ pub struct ContainerAppState {
     pub lifecycle: Arc<LifecycleManager>,
     pub power: Arc<PowerManager>,
     pub network: Arc<NetworkRebinder>,
+    pub pool: Arc<crate::network::pool::NetworkPool>,
 }
 
 // === Request DTOs ===
@@ -33,6 +36,19 @@ struct CreateContainerRequest {
     install_script: Option<String>,
     /// Pattern to detect when server is fully started (string or regex)
     start_pattern: Option<String>,
+    /// Port requests - user specifies container_port, we assign host_port from pool
+    ports: Option<Vec<PortRequest>>,
+}
+
+#[derive(Deserialize)]
+struct PortRequest {
+    pub container_port: u16,
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+}
+
+fn default_protocol() -> String {
+    "tcp".to_string()
 }
 
 #[derive(Deserialize)]
@@ -112,8 +128,9 @@ pub fn container_router(
     lifecycle: Arc<LifecycleManager>,
     power: Arc<PowerManager>,
     network: Arc<NetworkRebinder>,
+    pool: Arc<crate::network::pool::NetworkPool>,
 ) -> Router {
-    let state = ContainerAppState { manager, lifecycle, power, network };
+    let state = ContainerAppState { manager, lifecycle, power, network, pool };
 
     Router::new()
         // Container CRUD
@@ -129,6 +146,9 @@ pub fn container_router(
         // Update operations
         .route("/containers/:id/startup", post(update_startup_command))
         .route("/containers/:id/start-pattern", post(update_start_pattern))
+        .route("/containers/:id/resources", post(update_resources))
+        .route("/containers/:id/resources", get(get_resources))
+        .route("/containers/:id/volumes", post(update_volumes))
         // Power actions
         .route("/containers/:id/start", post(start_container))
         .route("/containers/:id/kill", post(kill_container))
@@ -160,6 +180,59 @@ async fn create_container(
             if let Some(pattern) = payload.start_pattern {
                 if let Ok(Some(mut container)) = state.manager.get_container(&payload.internal_id).await {
                     container.start_pattern = Some(pattern);
+                    let _ = state.manager.update_container(container).await;
+                }
+            }
+            
+            // Assign ports from pool if requested
+            if let Some(port_requests) = payload.ports {
+                let mut assigned_ports = Vec::new();
+                
+                for request in port_requests {
+                    // Get random available port from pool
+                    match state.pool.get_random_available().await {
+                        Ok(Some(network_port)) => {
+                            // Mark port as in use
+                            if let Err(e) = state.pool.mark_in_use(&network_port.id, true).await {
+                                tracing::error!("Failed to mark port {} as in use: {}", network_port.id, e);
+                                continue;
+                            }
+                            
+                            // Create port binding
+                            let binding = PortBinding {
+                                container_port: request.container_port,
+                                host_port: network_port.port,
+                                protocol: request.protocol,
+                            };
+                            
+                            assigned_ports.push(binding);
+                            tracing::info!("Assigned port {} -> {} for container {}", 
+                                request.container_port, network_port.port, payload.internal_id);
+                        }
+                        Ok(None) => {
+                            tracing::error!("No available ports in pool for container {}", payload.internal_id);
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(ErrorResponse {
+                                    error: "No available ports in pool".to_string(),
+                                }),
+                            ).into_response();
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to get port from pool: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!("Failed to assign ports: {}", e),
+                                }),
+                            ).into_response();
+                        }
+                    }
+                }
+                
+                // Update container with assigned ports
+                if let Ok(Some(mut container)) = state.manager.get_container(&payload.internal_id).await {
+                    container.ports = assigned_ports;
                     let _ = state.manager.update_container(container).await;
                 }
             }
@@ -235,6 +308,26 @@ async fn delete_container(
     State(state): State<ContainerAppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // Get container to check for ports before deletion
+    if let Ok(Some(container)) = state.manager.get_container(&id).await {
+        // Return ports to pool
+        for port_binding in &container.ports {
+            // Find the port in the pool by host_port and mark as available
+            if let Ok(all_ports) = state.pool.get_all_ports().await {
+                for network_port in all_ports {
+                    if network_port.port == port_binding.host_port && network_port.in_use {
+                        if let Err(e) = state.pool.mark_in_use(&network_port.id, false).await {
+                            tracing::error!("Failed to return port {} to pool: {}", network_port.port, e);
+                        } else {
+                            tracing::info!("Returned port {} to pool", network_port.port);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
     match state.manager.delete_container(&id).await {
         Ok(container) => (StatusCode::OK, Json(container)).into_response(),
         Err(e) => (
@@ -551,6 +644,174 @@ async fn rebind_network(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// === Container Update Handlers ===
+
+#[derive(Deserialize)]
+struct UpdateResourcesRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<i64>, // Memory in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_swap: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_reservation: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_shares: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_period: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_quota: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpuset_cpus: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blkio_weight: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct UpdateVolumesRequest {
+    volumes: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct ResourcesResponse {
+    memory: Option<i64>,
+    memory_swap: Option<i64>,
+    memory_reservation: Option<i64>,
+    cpu_shares: Option<i64>,
+    cpu_period: Option<i64>,
+    cpu_quota: Option<i64>,
+    cpuset_cpus: Option<String>,
+    blkio_weight: Option<u16>,
+}
+
+/// Update container resource limits (live, no restart)
+async fn update_resources(
+    State(state): State<ContainerAppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateResourcesRequest>,
+) -> Response {
+    // Create updater
+    let updater = match ContainerUpdater::new(state.manager.clone()) {
+        Ok((updater, _rx)) => updater,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to create updater: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let limits = ResourceLimits {
+        memory: payload.memory,
+        memory_swap: payload.memory_swap,
+        memory_reservation: payload.memory_reservation,
+        cpu_shares: payload.cpu_shares,
+        cpu_period: payload.cpu_period,
+        cpu_quota: payload.cpu_quota,
+        cpuset_cpus: payload.cpuset_cpus,
+        blkio_weight: payload.blkio_weight,
+    };
+
+    match updater.update_resources(id.clone(), limits).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(SuccessResponse {
+                message: "Resource update started".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Get current resource limits
+async fn get_resources(
+    State(state): State<ContainerAppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let updater = match ContainerUpdater::new(state.manager.clone()) {
+        Ok((updater, _rx)) => updater,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to create updater: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match updater.get_current_resources(&id).await {
+        Ok(limits) => (
+            StatusCode::OK,
+            Json(ResourcesResponse {
+                memory: limits.memory,
+                memory_swap: limits.memory_swap,
+                memory_reservation: limits.memory_reservation,
+                cpu_shares: limits.cpu_shares,
+                cpu_period: limits.cpu_period,
+                cpu_quota: limits.cpu_quota,
+                cpuset_cpus: limits.cpuset_cpus,
+                blkio_weight: limits.blkio_weight,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Update container volumes (requires restart)
+async fn update_volumes(
+    State(state): State<ContainerAppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateVolumesRequest>,
+) -> Response {
+    let updater = match ContainerUpdater::new(state.manager.clone()) {
+        Ok((updater, _rx)) => updater,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to create updater: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match updater.update_volumes(id.clone(), payload.volumes).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(SuccessResponse {
+                message: "Volumes updated (restart container to apply changes)".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),

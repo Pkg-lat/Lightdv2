@@ -93,7 +93,7 @@ pub async fn list_servers(page: i64) {
         if !container.ports.is_empty() {
             let ports_str: Vec<String> = container.ports.iter()
                 .take(3)
-                .map(|p| format!("{}:{}/{}", p.ip, p.port, p.protocol))
+                .map(|p| format!("{}:{}/{}", p.container_port, p.host_port, p.protocol))
                 .collect();
             let ports_display = if container.ports.len() > 3 {
                 format!("{} (+{})", ports_str.join(", "), container.ports.len() - 3)

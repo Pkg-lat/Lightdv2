@@ -2,8 +2,9 @@ use super::manager::ContainerManager;
 use crate::config::config::Config as AppConfig;
 
 use bollard::Docker;
-use bollard::container::{Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions};
+use bollard::container::{Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions, LogsOptions};
 use bollard::models::{HostConfig, Mount, MountTypeEnum};
+use futures::StreamExt;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +50,8 @@ impl LifecycleManager {
                 format!("Failed to load config: {}", e).into() 
             })?;
         let base_path = PathBuf::from(&config.storage.base_path);
+        
+        tracing::info!("Lifecycle manager initialized - containers will run as root");
 
         Ok((
             Self {
@@ -147,9 +150,9 @@ impl LifecycleManager {
         tokio::fs::create_dir_all(&volume_path).await?;
         tokio::fs::create_dir_all(&container_data_path).await?;
 
-        // Convert to absolute path strings
-        let volume_path_str = volume_path.canonicalize()?.to_string_lossy().to_string();
-        let container_data_path_str = container_data_path.canonicalize()?.to_string_lossy().to_string();
+        // Use absolute paths directly (don't canonicalize - causes issues with disk images)
+        let volume_path_str = volume_path.to_string_lossy().to_string();
+        let container_data_path_str = container_data_path.to_string_lossy().to_string();
 
         let mut mounts = vec![
             Mount {
@@ -180,7 +183,7 @@ impl LifecycleManager {
 
         // Create container config
         let mut host_config = HostConfig {
-            mounts: Some(mounts),
+            mounts: Some(mounts.clone()),
             ..Default::default()
         };
 
@@ -190,6 +193,28 @@ impl LifecycleManager {
         }
         if let Some(cpu) = state.limits.cpu {
             host_config.nano_cpus = Some((cpu * 1_000_000_000.0) as i64);
+        }
+
+        // Apply port bindings
+        let mut port_bindings = std::collections::HashMap::new();
+        let mut exposed_ports = std::collections::HashMap::new();
+        
+        for port_binding in &state.ports {
+            let container_port_key = format!("{}/{}", port_binding.container_port, port_binding.protocol);
+            let host_binding = bollard::models::PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(port_binding.host_port.to_string()),
+            };
+            
+            port_bindings.insert(container_port_key.clone(), Some(vec![host_binding]));
+            exposed_ports.insert(container_port_key, std::collections::HashMap::new());
+            
+            tracing::info!("Binding container port {} to host port {} ({})", 
+                port_binding.container_port, port_binding.host_port, port_binding.protocol);
+        }
+        
+        if !port_bindings.is_empty() {
+            host_config.port_bindings = Some(port_bindings);
         }
 
         let container_name = format!("lightd-{}", internal_id);
@@ -213,13 +238,18 @@ impl LifecycleManager {
         let entrypoint_path = container_data_path.join("entrypoint.sh");
         tokio::fs::write(&entrypoint_path, "#!/bin/sh\necho 'Container initializing...'\nsleep infinity\n").await?;
 
+        // For install phase, run as root. Will be recreated with lightd+ user after install
+        let container_user_config = None;  // Always run as root
+
         let config = Config {
             image: Some(image.clone()),
             working_dir: Some("/home/container".to_string()),
             host_config: Some(host_config),
             entrypoint: Some(vec!["/bin/sh".to_string(), "/app/data/entrypoint.sh".to_string()]),
+            user: container_user_config,
             tty: Some(true),
             open_stdin: Some(true),
+            exposed_ports: if exposed_ports.is_empty() { None } else { Some(exposed_ports) },
             ..Default::default()
         };
 
@@ -246,49 +276,78 @@ impl LifecycleManager {
             let install_path = container_data_path.join("install.sh");
             tokio::fs::write(&install_path, &script).await?;
 
-            // Update entrypoint to run install script
+            // Simple entrypoint that runs install (no log file, we'll capture via Docker logs)
             let install_entrypoint = 
-                "#!/bin/sh\ncd /home/container\n/bin/sh /app/data/install.sh\nexit_code=$?\necho \"Install script exited with code: $exit_code\"\nexit 0\n";
+                "#!/bin/sh\ncd /home/container\n/bin/sh /app/data/install.sh\n";
             tokio::fs::write(&entrypoint_path, install_entrypoint).await?;
 
             // Start container for installation
-            docker
-                .start_container(&container_id, None::<StartContainerOptions<String>>)
-                .await?;
+            docker.start_container(&container_id, None::<StartContainerOptions<String>>).await?;
 
-            tracing::info!("Started container {} for installation", internal_id);
+            // Stream logs in real-time while installing
+            let log_docker = docker.clone();
+            let log_container_id = container_id.clone();
+            let log_internal_id = internal_id.clone();
+            
+            tokio::spawn(async move {
+                let mut logs = log_docker.logs(&log_container_id, Some(LogsOptions::<String> {
+                    follow: true,
+                    stdout: true,
+                    stderr: true,
+                    ..Default::default()
+                }));
+                
+                while let Some(Ok(log)) = logs.next().await {
+                    let line = format!("{}", log);
+                    tracing::info!("[{}] {}", log_internal_id, line.trim());
+                }
+            });
 
-            // Wait for container to stop (install complete) with timeout
-            let timeout = tokio::time::Duration::from_secs(300); // 5 minute timeout
+            // Wait for container to stop (install complete)
+            let timeout = tokio::time::Duration::from_secs(600);
             let start_time = std::time::Instant::now();
+            let mut install_completed = false;
             
             loop {
                 if start_time.elapsed() > timeout {
-                    tracing::warn!("Installation timeout for container {}", internal_id);
+                    tracing::error!("Install timeout for {}", internal_id);
                     break;
                 }
 
                 match docker.inspect_container(&container_id, None).await {
                     Ok(info) => {
-                        if let Some(state) = info.state {
-                            if state.running == Some(false) {
-                                let exit_code = state.exit_code.unwrap_or(-1);
+                        if let Some(state_info) = info.state {
+                            if state_info.running == Some(false) {
+                                let exit_code = state_info.exit_code.unwrap_or(-1);
+                                install_completed = true;
+                                tracing::info!("Install complete for {} (exit code: {})", internal_id, exit_code);
+                                
                                 let _ = event_tx.send(LifecycleEvent::InstallScriptComplete(
                                     internal_id.clone(),
                                     exit_code as i32,
                                 ));
-                                tracing::info!("Install script for {} completed with exit code: {}", internal_id, exit_code);
+                                
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to inspect container during install: {}", e);
+                        tracing::error!("Failed to inspect container: {}", e);
+                        break;
                     }
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
+
+            if !install_completed {
+                tracing::error!("Install did not complete for {}", internal_id);
+                let _ = docker.stop_container(&container_id, None).await;
+            }
+
+            // Don't remove the container - we'll reuse it for runtime
+            // Just stop it so we can update the entrypoint
+            docker.stop_container(&container_id, None).await?;
         }
 
         // Setup final entrypoint with startup command
@@ -300,14 +359,36 @@ impl LifecycleManager {
         );
         tokio::fs::write(&entrypoint_path, final_entrypoint).await?;
 
-        tracing::info!("Set up final entrypoint for container {}", internal_id);
-
         // Mark as ready in database
         manager.mark_ready(&internal_id, container_id.clone()).await?;
-
         let _ = event_tx.send(LifecycleEvent::Ready(internal_id.clone()));
 
-        tracing::info!("Container {} installation complete and ready", internal_id);
+        // Start the container
+        docker.start_container(&container_id, None::<StartContainerOptions<String>>).await?;
+        tracing::info!("Started container {}", internal_id);
+
+        // Verify container is running
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        
+        match docker.inspect_container(&container_id, None).await {
+            Ok(info) => {
+                if let Some(state_info) = info.state {
+                    if state_info.running == Some(true) {
+                        tracing::info!("Container {} verified running", internal_id);
+                        let _ = event_tx.send(LifecycleEvent::Started(internal_id.clone()));
+                    } else {
+                        tracing::error!("Container {} not running after start", internal_id);
+                        let exit_code = state_info.exit_code.unwrap_or(-1);
+                        tracing::error!("Container exited with code: {}", exit_code);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to verify container {}: {}", internal_id, e);
+            }
+        }
+
+        tracing::info!("Container {} installation complete", internal_id);
         Ok(())
     }
 

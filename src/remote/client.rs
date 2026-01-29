@@ -142,6 +142,7 @@ impl RemoteClient {
     }
     
     /// Send current config to remote
+    #[allow(dead_code)]
     pub async fn send_config(
         &self,
         config: &serde_json::Value,

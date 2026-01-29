@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::filesystem::handler::VolumeHandler;
-//use crate::filesystem::volume::Volume;
+use crate::filesystem::fileinfo::FileObject;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +27,11 @@ struct VolumeResponse {
 #[derive(Serialize)]
 struct FilesResponse {
     files: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FilesDetailedResponse {
+    files: Vec<FileObject>,
 }
 
 #[derive(Serialize)]
@@ -122,6 +127,7 @@ pub fn volume_router(volume_handler: Arc<VolumeHandler>) -> Router {
         .route("/volumes", get(list_volumes))
         .route("/volumes/:id", delete(delete_volume))
         .route("/volumes/:id/files", get(list_files))
+        .route("/volumes/:id/files/detailed", get(list_files_detailed))
         .route("/volumes/:id/write", post(write_file))
         .route("/volumes/:id/create-folder", post(create_folder))
         .route("/volumes/:id/copy", post(copy_file_or_folder))
@@ -134,9 +140,9 @@ pub fn volume_router(volume_handler: Arc<VolumeHandler>) -> Router {
 
 async fn create_volume(
     State(state): State<AppState>,
-    Json(payload): Json<Option<CreateVolumeRequest>>,
+    body: Option<Json<CreateVolumeRequest>>,
 ) -> Result<Json<VolumeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let size_mb = payload.and_then(|p| p.size);
+    let size_mb = body.and_then(|b| b.size);
     
     let result = if size_mb.is_some() {
         state.volume_handler.create_volume_with_quota(size_mb).await
@@ -341,6 +347,21 @@ async fn resize_volume(
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn list_files_detailed(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FilesDetailedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match state.volume_handler.list_volume_files_detailed(&id, None).await {
+        Ok(files) => Ok(Json(FilesDetailedResponse { files })),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),

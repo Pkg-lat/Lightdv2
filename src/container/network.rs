@@ -63,11 +63,11 @@ impl NetworkRebinder {
 
         // Validate ports
         for port in &new_ports {
-            if port.ip.trim().is_empty() {
-                return Err("Port IP cannot be empty".into());
+            if port.container_port == 0 {
+                return Err("Container port cannot be 0".into());
             }
-            if port.port == 0 {
-                return Err("Port number cannot be 0".into());
+            if port.host_port == 0 {
+                return Err("Host port cannot be 0".into());
             }
             let protocol = port.protocol.to_lowercase();
             if protocol != "tcp" && protocol != "udp" {
@@ -209,13 +209,13 @@ impl NetworkRebinder {
         let mut port_bindings = PortMap::new();
         for port in &new_ports {
             let protocol = port.protocol.to_lowercase();
-            let key = format!("{}/{}", port.port, protocol);
+            let key = format!("{}/{}", port.container_port, protocol);
             
             port_bindings.insert(
                 key,
                 Some(vec![DockerPortBinding {
-                    host_ip: Some(port.ip.clone()),
-                    host_port: Some(port.port.to_string()),
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some(port.host_port.to_string()),
                 }]),
             );
         }

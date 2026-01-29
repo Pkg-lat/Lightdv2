@@ -458,13 +458,13 @@ impl FirewallManager {
         
         // Validate ports are in valid range
         if let Some(port) = rule.source_port {
-            if port == 0 || port > 65535 {
+            if port == 0 {
                 return Err("Invalid source port".into());
             }
         }
         
         if let Some(port) = rule.dest_port {
-            if port == 0 || port > 65535 {
+            if port == 0 {
                 return Err("Invalid destination port".into());
             }
         }

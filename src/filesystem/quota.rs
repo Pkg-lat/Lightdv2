@@ -19,6 +19,7 @@ pub struct DiskQuota {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct QuotaConfig {
     pub volume_id: String,
     pub size_mb: u64,
@@ -27,6 +28,7 @@ pub struct QuotaConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
 pub enum QuotaType {
     #[cfg(target_os = "macos")]
     DiskImage,
@@ -254,6 +256,7 @@ impl QuotaManager {
     }
 
     /// Check if volume is out of space
+    #[allow(dead_code)]
     pub async fn check_quota_exceeded(
         &self,
         volume_id: &str,
@@ -277,6 +280,7 @@ impl QuotaManager {
     }
 
     /// Calculate directory size recursively
+    #[allow(dead_code)]
     async fn calculate_directory_size(
         &self,
         path: &Path,

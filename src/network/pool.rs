@@ -122,6 +122,30 @@ impl NetworkPool {
         Ok(deleted)
     }
 
+    pub async fn bulk_add(&self, ports: Vec<(String, u16, String)>) -> Result<Vec<NetworkPort>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut added = Vec::new();
+        
+        for (ip, port, protocol) in ports {
+            match self.add_port(ip, port, Some(protocol)).await {
+                Ok(network_port) => added.push(network_port),
+                Err(e) => tracing::warn!("Failed to add port {}: {}", port, e),
+            }
+        }
+
+        Ok(added)
+    }
+
+    pub async fn get_available_ports(&self) -> Result<Vec<NetworkPort>, Box<dyn std::error::Error + Send + Sync>> {
+        let ports = self.get_all_ports().await?;
+        Ok(ports.into_iter().filter(|p| !p.in_use).collect())
+    }
+
+    pub async fn return_port_to_pool(&self, id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.mark_in_use(id, false).await?;
+        tracing::info!("Returned port {} to pool", id);
+        Ok(())
+    }
+
     async fn open_iptables_port(&self, ip: &str, port: u16, protocol: &str) {
         #[cfg(unix)]
         {

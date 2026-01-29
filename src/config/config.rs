@@ -48,17 +48,15 @@ pub struct StorageConfig {
 pub struct MonitoringConfig {
     pub enabled: bool,
     pub interval_ms: u64,
-    pub ru_config: RuConfig,
+    pub billing: BillingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RuConfig {
-    pub cpu_weight: f64,
-    pub memory_weight: f64,
-    pub io_weight: f64,
-    pub network_weight: f64,
-    pub storage_weight: f64,
-    pub base_ru: f64,
+pub struct BillingConfig {
+    pub memory_per_gb_hour: f64,
+    pub cpu_per_vcpu_hour: f64,
+    pub storage_per_gb_hour: f64,
+    pub egress_per_gb: f64,
 }
 
 impl Config {
