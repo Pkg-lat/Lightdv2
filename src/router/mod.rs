@@ -4,5 +4,6 @@ pub mod container;
 pub mod auth;
 pub mod public;
 pub mod remote;
+pub mod sftp;
 pub mod firewall;
 pub mod billing;

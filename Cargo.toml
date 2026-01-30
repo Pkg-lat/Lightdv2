@@ -26,5 +26,12 @@ regex = "1.10"
 dashmap = "5.5"
 chrono = "0.4"
 reqwest = { version = "0.11", features = ["json"] }
+russh = "0.44"
+russh-keys = "0.44"
+russh-sftp = "2.0.0-rc.4"
+async-trait = "0.1"
+bcrypt = "0.15"
+anyhow = "1.0"
+bytes = "1.5"
 infer = "0.16"
 

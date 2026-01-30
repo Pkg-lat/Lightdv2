@@ -27,8 +27,13 @@
     }
   },
   "remote": {
-    "enabled": true,
+    "enabled": false,
     "url": "https://your-remote-api.com/api",
     "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+  },
+  "sftp": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 2022
   }
 }

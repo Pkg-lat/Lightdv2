@@ -29,6 +29,7 @@ impl Default for ContainerUser {
 
 pub struct UserManager;
 
+#[allow(unused)]
 impl UserManager {
     /// Ensure the lightd+ user exists on the system
     pub fn ensure_user_exists() -> Result<ContainerUser, Box<dyn std::error::Error + Send + Sync>> {

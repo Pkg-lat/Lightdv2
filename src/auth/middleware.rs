@@ -51,6 +51,7 @@ fn validate_bearer_token(headers: &HeaderMap, api_token: &str) -> bool {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                // if the token doesn't start with that aswell, we just fuck off.
                 return token.starts_with("lightd_") && token == api_token;
             }
         }

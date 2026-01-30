@@ -44,14 +44,13 @@ impl LifecycleManager {
         let docker = Docker::connect_with_local_defaults()?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         
-        // Load config to get the storage path
         let config = AppConfig::load("config.json")
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { 
                 format!("Failed to load config: {}", e).into() 
             })?;
         let base_path = PathBuf::from(&config.storage.base_path);
         
-        tracing::info!("Lifecycle manager initialized - containers will run as root");
+        tracing::info!("Lifecycle manager initialized");
 
         Ok((
             Self {
@@ -62,6 +61,59 @@ impl LifecycleManager {
             },
             event_rx,
         ))
+    }
+
+    /// Ensure Lightd network exists
+    pub async fn ensure_network(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Self::ensure_network_static(&self.docker).await
+    }
+
+    /// Ensure Lightd network exists (static version for use in spawned tasks)
+    async fn ensure_network_static(docker: &Docker) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
+        use std::collections::HashMap;
+        
+        const NETWORK_NAME: &str = "lightd_network";
+        
+        // Check if network exists
+        match docker.inspect_network(NETWORK_NAME, None::<InspectNetworkOptions<String>>).await {
+            Ok(network) => {
+                if let Some(id) = network.id {
+                    tracing::debug!("Lightd network exists: {}", id);
+                    return Ok(id);
+                }
+            }
+            Err(e) => {
+                if !e.to_string().contains("404") && !e.to_string().contains("not found") {
+                    return Err(e.into());
+                }
+            }
+        }
+        
+        // Create network
+        tracing::info!("Creating Lightd network");
+        
+        let mut labels = HashMap::new();
+        labels.insert("managed-by", "lightd");
+        
+        let config = CreateNetworkOptions {
+            name: NETWORK_NAME,
+            check_duplicate: true,
+            driver: "bridge",
+            internal: false,
+            attachable: true,
+            ingress: false,
+            enable_ipv6: false,
+            labels,
+            ..Default::default()
+        };
+        
+        let response = docker.create_network(config).await?;
+        
+        let network_id = response.id.ok_or("Network created but no ID returned")?;
+        tracing::info!("Created Lightd network: {}", network_id);
+        
+        Ok(network_id)
     }
 
     /// Verify Docker daemon is running and accessible
@@ -265,9 +317,13 @@ impl LifecycleManager {
             return Err(format!("Failed to pull image: {}", e).into());
         }
 
+        // Ensure Lightd network exists
+        let network_id = Self::ensure_network_static(&docker).await?;
+
         // Create container config
         let mut host_config = HostConfig {
             mounts: Some(mounts.clone()),
+            network_mode: Some("lightd_network".to_string()),
             ..Default::default()
         };
 
@@ -353,6 +409,8 @@ impl LifecycleManager {
         tracing::info!("Container {} created with Docker ID: {}", internal_id, container_id);
 
         // Run install script if provided
+        // This is prob universal, later we can 
+        // check if this is proper
         if let Some(script) = install_script {
             let _ = event_tx.send(LifecycleEvent::RunningInstallScript(internal_id.clone()));
 
@@ -360,7 +418,9 @@ impl LifecycleManager {
             let install_path = container_data_path.join("install.sh");
             tokio::fs::write(&install_path, &script).await?;
 
-            // Simple entrypoint that runs install (no log file, we'll capture via Docker logs)
+            // Simple entrypoint that runs install
+            // This is if install content is provided
+            // :D
             let install_entrypoint = 
                 "#!/bin/sh\ncd /home/container\n/bin/sh /app/data/install.sh\n";
             tokio::fs::write(&entrypoint_path, install_entrypoint).await?;
@@ -368,7 +428,8 @@ impl LifecycleManager {
             // Start container for installation
             docker.start_container(&container_id, None::<StartContainerOptions<String>>).await?;
 
-            // Stream logs in real-time while installing
+            // Allow logs to be streamed
+            // Very effective
             let log_docker = docker.clone();
             let log_container_id = container_id.clone();
             let log_internal_id = internal_id.clone();
@@ -388,6 +449,8 @@ impl LifecycleManager {
             });
 
             // Wait for container to stop (install complete)
+            // Kinda weird we have a timeout time period, maybe we can change this to get from the config
+            // TODO: MAKE it so that the timeout is taken from the config.json
             let timeout = tokio::time::Duration::from_secs(600);
             let start_time = std::time::Instant::now();
             let mut install_completed = false;
@@ -421,6 +484,7 @@ impl LifecycleManager {
                     }
                 }
 
+                // Let's wait, it's useful here
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
 
@@ -605,6 +669,7 @@ impl LifecycleManager {
     }
 
     /* Dead code
+    // Not used anymore
     pub async fn get_container_id(
         &self,
         internal_id: &str,

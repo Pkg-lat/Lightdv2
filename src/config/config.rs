@@ -11,6 +11,8 @@ pub struct Config {
     pub monitoring: MonitoringConfig,
     #[serde(default)]
     pub remote: Option<RemoteConfig>,
+    #[serde(default)]
+    pub sftp: Option<SftpConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -18,6 +20,13 @@ pub struct RemoteConfig {
     pub enabled: bool,
     pub url: String,
     pub token: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SftpConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

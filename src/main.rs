@@ -9,6 +9,7 @@ mod websocket;
 mod auth;
 mod cli;
 mod remote;
+mod sftp;
 mod billing;
 
 use axum::routing::get;
@@ -90,6 +91,11 @@ async fn main_app(timer: Timer) {
     let token_manager = Arc::new(auth::tokens::TokenManager::new(&tokens_db_path)
         .expect("Failed to initialize token manager"));
     
+    // Initialize SFTP credentials manager
+    let sftp_creds_db_path = format!("{}/sftp_credentials.db", config.storage.base_path);
+    let sftp_credentials_manager = Arc::new(sftp::credentials::CredentialsManager::new(&sftp_creds_db_path)
+        .expect("Failed to initialize SFTP credentials manager"));
+    
     // Spawn token cleanup task (runs every 5 minutes)
     let token_manager_cleanup = token_manager.clone();
     tokio::spawn(async move {
@@ -111,6 +117,7 @@ async fn main_app(timer: Timer) {
         .expect("Failed to initialize network pool"));
     
     // Initialize default ports (25565-25569) on first startup
+    // Todo: Fix these so that users can choose via the config.json for said system.
     let default_ports = vec![
         ("0.0.0.0".to_string(), 25565, "tcp".to_string()),
         ("0.0.0.0".to_string(), 25566, "tcp".to_string()),
@@ -166,6 +173,26 @@ async fn main_app(timer: Timer) {
     } else {
         None
     };
+    
+    // Start SFTP server if enabled
+    if let Some(sftp_config) = &config.sftp {
+        if sftp_config.enabled {
+            let sftp_server = Arc::new(sftp::server::SftpServerManager::new(
+                sftp_credentials_manager.clone(),
+                config.storage.volumes_path.clone(),
+                sftp_config.port,
+            ));
+            
+            let sftp_server_clone = sftp_server.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sftp_server_clone.start().await {
+                    tracing::error!("SFTP server error: {}", e);
+                }
+            });
+            
+            tracing::info!("SFTP server enabled on port {}", sftp_config.port);
+        }
+    }
     
     // Initialize billing tracker with remote sync and container manager
     let billing_tracker = {
@@ -243,6 +270,17 @@ async fn main_app(timer: Timer) {
         Err(_) => {
             eprintln!("Docker check timeout");
             eprintln!("Please ensure Docker Desktop is running");
+            return;
+        }
+    }
+    
+    // Ensure Lightd network exists
+    match lifecycle_manager.ensure_network().await {
+        Ok(network_id) => {
+            tracing::info!("Lightd network ready: {}", network_id);
+        }
+        Err(e) => {
+            eprintln!("Failed to create Lightd network: {}", e);
             return;
         }
     }
@@ -375,10 +413,20 @@ async fn main_app(timer: Timer) {
     
     // Setup routers
     let public_routes = router::public::public_router();
-    let auth_routes = router::auth::auth_router(token_manager);
+    let auth_routes = router::auth::auth_router(token_manager.clone());
     let remote_routes = router::remote::remote_router();
     let firewall_routes = router::firewall::firewall_router(firewall_manager);
     let billing_routes = router::billing::billing_router(billing_tracker);
+    
+    // SFTP routes
+    let sftp_host = config.server.host.clone();
+    let sftp_port = config.sftp.as_ref().map(|s| s.port).unwrap_or(2022);
+    let sftp_routes = router::sftp::sftp_router(
+        sftp_credentials_manager,
+        container_manager.clone(),
+        sftp_host,
+        sftp_port,
+    );
     
     // Create auth config for middleware
     let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config));
@@ -391,6 +439,8 @@ async fn main_app(timer: Timer) {
     let firewall_protected_routes = firewall_routes
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let billing_protected_routes = billing_routes
+        .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+    let sftp_protected_routes = sftp_routes
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let container_routes = router::container::container_router(container_manager, lifecycle_manager, power_manager, network_rebinder, network_pool)
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
@@ -408,11 +458,12 @@ async fn main_app(timer: Timer) {
         .merge(network_routes)
         .merge(firewall_protected_routes)
         .merge(billing_protected_routes)
+        .merge(sftp_protected_routes)
         .merge(container_routes)
         .merge(ws_routes)
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(Any) // Todo: Get from config.json origin array
                 .allow_methods(Any)
                 .allow_headers(Any)
         );
