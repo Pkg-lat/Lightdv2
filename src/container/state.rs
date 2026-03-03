@@ -35,8 +35,25 @@ pub struct PortBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerLimits {
+    #[serde(default)]
     pub memory: Option<i64>,
+    #[serde(default)]
+    pub memory_swap: Option<i64>,
+    #[serde(default)]
+    pub memory_reservation: Option<i64>,
+    #[serde(default)]
     pub cpu: Option<f64>,
+    #[serde(default)]
+    pub cpu_shares: Option<i64>,
+    #[serde(default)]
+    pub cpu_period: Option<i64>,
+    #[serde(default)]
+    pub cpu_quota: Option<i64>,
+    #[serde(default)]
+    pub cpuset_cpus: Option<String>,
+    #[serde(default)]
+    pub blkio_weight: Option<u16>,
+    #[serde(default)]
     pub disk: Option<i64>,
 }
 
@@ -57,7 +74,14 @@ impl ContainerState {
             mount: HashMap::new(),
             limits: ContainerLimits {
                 memory: None,
+                memory_swap: None,
+                memory_reservation: None,
                 cpu: None,
+                cpu_shares: None,
+                cpu_period: None,
+                cpu_quota: None,
+                cpuset_cpus: None,
+                blkio_weight: None,
                 disk: None,
             },
             container_id: None,

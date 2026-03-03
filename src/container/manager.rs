@@ -269,13 +269,21 @@ impl ContainerManager {
 
         if let Some(mut state) = self.get_container(internal_id).await? {
             // Update limits in state
-            if let Some(memory) = limits.memory {
-                state.limits.memory = Some(memory);
-            }
-            if let Some(cpu) = limits.cpu_shares {
-                // Convert CPU shares to CPU cores (approximate)
-                state.limits.cpu = Some(cpu as f64 / 1024.0);
-            }
+            state.limits.memory = limits.memory;
+            state.limits.memory_swap = limits.memory_swap;
+            state.limits.memory_reservation = limits.memory_reservation;
+            state.limits.cpu_shares = limits.cpu_shares;
+            state.limits.cpu_period = limits.cpu_period;
+            state.limits.cpu_quota = limits.cpu_quota;
+            state.limits.cpuset_cpus = limits.cpuset_cpus;
+            state.limits.blkio_weight = limits.blkio_weight;
+
+            state.limits.cpu = match (state.limits.cpu_quota, state.limits.cpu_period) {
+                (Some(quota), Some(period)) if quota > 0 && period > 0 => {
+                    Some(quota as f64 / period as f64)
+                }
+                _ => state.limits.cpu_shares.map(|shares| shares as f64 / 1024.0),
+            };
             
             state.update_timestamp();
 

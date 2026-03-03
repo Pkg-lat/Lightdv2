@@ -1,6 +1,7 @@
 //! SFTP server implementation
 //! 
 //! Runs SFTP server as part of lightd daemon with per-container isolation
+//! Very fun stuff, but most of the time it doesn't work a lot.
 
 use russh::server::{Config as SshConfig, run_stream};
 use russh_keys::key::KeyPair;

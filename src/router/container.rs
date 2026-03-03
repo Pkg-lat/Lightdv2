@@ -12,7 +12,7 @@ use crate::container::lifecycle::LifecycleManager;
 use crate::container::manager::ContainerManager;
 use crate::container::power::{PowerManager, PowerAction};
 use crate::container::network::NetworkRebinder;
-use crate::container::state::{InstallState, PortBinding};
+use crate::container::state::{ContainerState, InstallState, PortBinding};
 use crate::container::update::{ContainerUpdater, ResourceLimits};
 use std::collections::HashMap;
 
@@ -273,7 +273,10 @@ async fn list_containers(
     State(state): State<ContainerAppState>,
 ) -> Response {
     match state.manager.list_containers().await {
-        Ok(containers) => (StatusCode::OK, Json(containers)).into_response(),
+        Ok(mut containers) => {
+            hydrate_live_limits(&state, &mut containers).await;
+            (StatusCode::OK, Json(containers)).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -288,7 +291,10 @@ async fn get_container(
     Path(id): Path<String>,
 ) -> Response {
     match state.manager.get_container(&id).await {
-        Ok(Some(container)) => (StatusCode::OK, Json(container)).into_response(),
+        Ok(Some(mut container)) => {
+            hydrate_single_live_limits(&state, &mut container).await;
+            (StatusCode::OK, Json(container)).into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -301,6 +307,84 @@ async fn get_container(
                 error: e.to_string(),
             }),
         ).into_response(),
+    }
+}
+
+fn apply_live_limits(container: &mut ContainerState, limits: &ResourceLimits) {
+    container.limits.memory = limits.memory;
+    container.limits.memory_swap = limits.memory_swap;
+    container.limits.memory_reservation = limits.memory_reservation;
+    container.limits.cpu_shares = limits.cpu_shares;
+    container.limits.cpu_period = limits.cpu_period;
+    container.limits.cpu_quota = limits.cpu_quota;
+    container.limits.cpuset_cpus = limits.cpuset_cpus.clone();
+    container.limits.blkio_weight = limits.blkio_weight;
+    container.limits.cpu = match (limits.cpu_quota, limits.cpu_period) {
+        (Some(quota), Some(period)) if quota > 0 && period > 0 => Some(quota as f64 / period as f64),
+        _ => limits.cpu_shares.map(|shares| shares as f64 / 1024.0),
+    };
+}
+
+async fn hydrate_single_live_limits(state: &ContainerAppState, container: &mut ContainerState) {
+    if container.container_id.is_none() {
+        return;
+    }
+
+    let updater = match ContainerUpdater::new(state.manager.clone()) {
+        Ok((updater, _rx)) => updater,
+        Err(e) => {
+            tracing::warn!(
+                container_id = %container.internal_id,
+                error = %e,
+                "Could not create updater for live limits hydration"
+            );
+            return;
+        }
+    };
+
+    match updater.get_current_resources(&container.internal_id).await {
+        Ok(limits) => {
+            apply_live_limits(container, &limits);
+            tracing::debug!(
+                container_id = %container.internal_id,
+                cpu_quota = ?limits.cpu_quota,
+                cpu_period = ?limits.cpu_period,
+                memory = ?limits.memory,
+                "Hydrated live limits from Docker"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                container_id = %container.internal_id,
+                error = %e,
+                "Failed to hydrate live limits from Docker; returning stored state"
+            );
+        }
+    }
+}
+
+async fn hydrate_live_limits(state: &ContainerAppState, containers: &mut [ContainerState]) {
+    let updater = match ContainerUpdater::new(state.manager.clone()) {
+        Ok((updater, _rx)) => updater,
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not create updater for live limits hydration");
+            return;
+        }
+    };
+
+    for container in containers.iter_mut() {
+        if container.container_id.is_none() {
+            continue;
+        }
+
+        match updater.get_current_resources(&container.internal_id).await {
+            Ok(limits) => apply_live_limits(container, &limits),
+            Err(e) => tracing::warn!(
+                container_id = %container.internal_id,
+                error = %e,
+                "Failed to hydrate live limits from Docker for container"
+            ),
+        }
     }
 }
 
@@ -510,19 +594,34 @@ async fn update_startup_command(
     Path(id): Path<String>,
     Json(payload): Json<UpdateStartupRequest>,
 ) -> Response {
-    match state.manager.update_startup_command(&id, payload.startup_command).await {
+    let startup_command = payload.startup_command;
+    tracing::info!(
+        container_id = %id,
+        command_length = startup_command.len(),
+        "Startup command update requested"
+    );
+
+    match state.manager.update_startup_command(&id, startup_command).await {
         Ok(_) => (
-            StatusCode::OK,
-            Json(SuccessResponse {
-                message: "Startup command updated".to_string(),
-            }),
+            {
+                tracing::info!(container_id = %id, "Startup command updated");
+                (
+                    StatusCode::OK,
+                    Json(SuccessResponse {
+                        message: "Startup command updated".to_string(),
+                    }),
+                )
+            }
         ).into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        ).into_response(),
+        Err(e) => {
+            tracing::error!(container_id = %id, error = %e, "Startup command update failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        }.into_response(),
     }
 }
 
@@ -532,19 +631,34 @@ async fn update_start_pattern(
     Path(id): Path<String>,
     Json(payload): Json<UpdateStartPatternRequest>,
 ) -> Response {
-    match state.manager.update_start_pattern(&id, payload.start_pattern).await {
+    let start_pattern = payload.start_pattern;
+    tracing::info!(
+        container_id = %id,
+        has_pattern = start_pattern.is_some(),
+        "Start pattern update requested"
+    );
+
+    match state.manager.update_start_pattern(&id, start_pattern).await {
         Ok(_) => (
-            StatusCode::OK,
-            Json(SuccessResponse {
-                message: "Start pattern updated".to_string(),
-            }),
+            {
+                tracing::info!(container_id = %id, "Start pattern updated");
+                (
+                    StatusCode::OK,
+                    Json(SuccessResponse {
+                        message: "Start pattern updated".to_string(),
+                    }),
+                )
+            }
         ).into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        ).into_response(),
+        Err(e) => {
+            tracing::error!(container_id = %id, error = %e, "Start pattern update failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        }.into_response(),
     }
 }
 
@@ -722,21 +836,40 @@ async fn update_resources(
         blkio_weight: payload.blkio_weight,
     };
 
+    tracing::info!(
+        container_id = %id,
+        memory = ?limits.memory,
+        memory_swap = ?limits.memory_swap,
+        memory_reservation = ?limits.memory_reservation,
+        cpu_shares = ?limits.cpu_shares,
+        cpu_period = ?limits.cpu_period,
+        cpu_quota = ?limits.cpu_quota,
+        cpuset_cpus = ?limits.cpuset_cpus,
+        blkio_weight = ?limits.blkio_weight,
+        "Resource limits update requested"
+    );
+
     match updater.update_resources(id.clone(), limits).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(SuccessResponse {
-                message: "Resource update started".to_string(),
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            tracing::info!(container_id = %id, "Resource limits update accepted");
+            (
+                StatusCode::ACCEPTED,
+                Json(SuccessResponse {
+                    message: "Resource update started".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(container_id = %id, error = %e, "Resource limits update failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -745,6 +878,8 @@ async fn get_resources(
     State(state): State<ContainerAppState>,
     Path(id): Path<String>,
 ) -> Response {
+    tracing::debug!(container_id = %id, "Resource limits lookup requested");
+
     let updater = match ContainerUpdater::new(state.manager.clone()) {
         Ok((updater, _rx)) => updater,
         Err(e) => {
@@ -759,27 +894,45 @@ async fn get_resources(
     };
 
     match updater.get_current_resources(&id).await {
-        Ok(limits) => (
-            StatusCode::OK,
-            Json(ResourcesResponse {
-                memory: limits.memory,
-                memory_swap: limits.memory_swap,
-                memory_reservation: limits.memory_reservation,
-                cpu_shares: limits.cpu_shares,
-                cpu_period: limits.cpu_period,
-                cpu_quota: limits.cpu_quota,
-                cpuset_cpus: limits.cpuset_cpus,
-                blkio_weight: limits.blkio_weight,
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(limits) => {
+            tracing::debug!(
+                container_id = %id,
+                memory = ?limits.memory,
+                memory_swap = ?limits.memory_swap,
+                memory_reservation = ?limits.memory_reservation,
+                cpu_shares = ?limits.cpu_shares,
+                cpu_period = ?limits.cpu_period,
+                cpu_quota = ?limits.cpu_quota,
+                cpuset_cpus = ?limits.cpuset_cpus,
+                blkio_weight = ?limits.blkio_weight,
+                "Resource limits fetched"
+            );
+
+            (
+                StatusCode::OK,
+                Json(ResourcesResponse {
+                    memory: limits.memory,
+                    memory_swap: limits.memory_swap,
+                    memory_reservation: limits.memory_reservation,
+                    cpu_shares: limits.cpu_shares,
+                    cpu_period: limits.cpu_period,
+                    cpu_quota: limits.cpu_quota,
+                    cpuset_cpus: limits.cpuset_cpus,
+                    blkio_weight: limits.blkio_weight,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(container_id = %id, error = %e, "Resource limits lookup failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -789,6 +942,15 @@ async fn update_volumes(
     Path(id): Path<String>,
     Json(payload): Json<UpdateVolumesRequest>,
 ) -> Response {
+    let volumes = payload.volumes;
+    let volume_targets: Vec<&str> = volumes.keys().map(String::as_str).collect();
+    tracing::info!(
+        container_id = %id,
+        volume_count = volumes.len(),
+        targets = ?volume_targets,
+        "Volume update requested"
+    );
+
     let updater = match ContainerUpdater::new(state.manager.clone()) {
         Ok((updater, _rx)) => updater,
         Err(e) => {
@@ -802,20 +964,26 @@ async fn update_volumes(
         }
     };
 
-    match updater.update_volumes(id.clone(), payload.volumes).await {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(SuccessResponse {
-                message: "Volumes updated (restart container to apply changes)".to_string(),
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+    match updater.update_volumes(id.clone(), volumes).await {
+        Ok(()) => {
+            tracing::info!(container_id = %id, "Volume update accepted");
+            (
+                StatusCode::ACCEPTED,
+                Json(SuccessResponse {
+                    message: "Volumes updated (restart container to apply changes)".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(container_id = %id, error = %e, "Volume update failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }

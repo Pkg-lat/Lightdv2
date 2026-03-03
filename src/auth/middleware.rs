@@ -8,7 +8,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use serde_json::json;
+use serde_json::json
 use std::sync::Arc;
 
 use crate::config::config::Config;
@@ -23,7 +23,7 @@ impl AuthConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             api_token: config.authorization.token.clone(),
-            allowed_origins: vec!["*".to_string()], // TODO: Load from config
+            allowed_origins: config.authorization.allowed_origins.clone(),
         }
     }
 }
@@ -40,19 +40,33 @@ fn is_origin_allowed(origin: Option<&str>, allowed_origins: &[String]) -> bool {
 fn validate_vendor(headers: &HeaderMap) -> bool {
     if let Some(accept) = headers.get("accept") {
         if let Ok(accept_str) = accept.to_str() {
-            return accept_str.contains("Application/vnd.pkglat");
+            return accept_str.contains("Application/vnd.pkglatv1+json");
         }
     }
     false
 }
 
-/// Extract and validate Bearer token
+/// Extract and validate Bearer token with constant-time comparison
 fn validate_bearer_token(headers: &HeaderMap, api_token: &str) -> bool {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                // if the token doesn't start with that aswell, we just fuck off.
-                return token.starts_with("lightd_") && token == api_token;
+                // Constant-time comparison for security
+                use subtle::ConstantTimeEq;
+                
+                // Check if token starts with "lightd_"
+                if !token.starts_with("lightd_") {
+                    return false;
+                }
+                
+                // Constant-time comparison
+                let token_bytes = token.as_bytes();
+                let api_token_bytes = api_token.as_bytes();
+                
+                // Use constant-time comparison
+                if token_bytes.ct_eq(api_token_bytes).into() {
+                    return true;
+                }
             }
         }
     }

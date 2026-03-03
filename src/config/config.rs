@@ -39,6 +39,12 @@ pub struct ServerConfig {
 pub struct AuthConfig {
     pub enabled: bool,
     pub token: String,
+    #[serde(default = "default_origins")]
+    pub allowed_origins: Vec<String>,
+}
+
+fn default_origins() -> Vec<String> {
+    vec!["*".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -14,6 +14,7 @@ mod billing;
 
 use axum::routing::get;
 use axum::Router;
+use axum::http::HeaderValue;
 use clap::Parser;
 use daemon::timer::Timer;
 use std::sync::Arc;
@@ -450,6 +451,24 @@ async fn main_app(timer: Timer) {
         .route("/ws/:id", get(websocket::ws_handler))
         .with_state(ws_state);
     
+    // Build CORS layer based on allowed origins from config
+    let cors_layer = if config.authorization.allowed_origins.contains(&"*".to_string()) {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let mut cors = CorsLayer::new();
+        for origin in &config.authorization.allowed_origins {
+            if origin == "*" {
+                cors = cors.allow_origin(Any);
+            } else {
+                cors = cors.allow_origin(origin.parse::<HeaderValue>().unwrap());
+            }
+        }
+        cors.allow_methods(Any).allow_headers(Any)
+    };
+    
     // Combine routes with CORS
     let app = public_routes
         .merge(auth_routes)
@@ -461,12 +480,7 @@ async fn main_app(timer: Timer) {
         .merge(sftp_protected_routes)
         .merge(container_routes)
         .merge(ws_routes)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any) // Todo: Get from config.json origin array
-                .allow_methods(Any)
-                .allow_headers(Any)
-        );
+        .layer(cors_layer);
     
     // Start server
     // as son as server starts we set startup time

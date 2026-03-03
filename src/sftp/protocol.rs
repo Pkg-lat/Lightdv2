@@ -10,6 +10,8 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+use crate::filesystem::security;
+
 /// SFTP file handle
 pub struct SftpHandle {
     pub path: PathBuf,
@@ -68,38 +70,13 @@ impl SftpProtocol {
         format!("handle_{}", *counter)
     }
     
-    /// Resolve and validate path within chroot
+    /// Resolve and validate path within chroot using security module
     fn resolve_path(&self, requested_path: &str) -> Result<PathBuf, String> {
         let normalized = self.normalize_requested_path(requested_path);
         let norm = normalized.as_ref();
-        let requested = Path::new(norm);
         
-        let full_path = if norm == "." || norm.is_empty() {
-            self.volume_path.clone()
-        } else if requested.is_absolute() {
-            return Err("Invalid path".to_string());
-        } else {
-            self.volume_path.join(requested)
-        };
-        
-        // Canonicalize when path exists; otherwise build path from canonical parent
-        let canonical = match full_path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => {
-                let parent = full_path.parent().ok_or("Invalid path")?;
-                let name = full_path.file_name().ok_or("Invalid path")?;
-                let parent_canonical = parent.canonicalize()
-                    .map_err(|_| "Invalid path".to_string())?;
-                parent_canonical.join(name)
-            }
-        };
-        
-        if !canonical.starts_with(&self.volume_path) {
-            tracing::warn!("Path traversal attempt: {:?} -> {:?}", requested_path, canonical);
-            return Err("Access denied: path outside volume".to_string());
-        }
-        
-        Ok(canonical)
+        // Use security module for validation - this prevents all path traversal attacks
+        security::validate_path(&self.volume_path, norm)
     }
     
     /// Convert file metadata to SFTP attributes

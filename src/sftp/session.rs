@@ -1,6 +1,8 @@
 //! SFTP session handler with chroot isolation
 //! 
 //! Handles SFTP sessions with path isolation to container volumes
+//! If u find problems drop me an email asap at hello@nadhi.dev
+//! Also we prefer if u set the 
 
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};

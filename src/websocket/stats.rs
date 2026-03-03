@@ -4,6 +4,7 @@
 
 use bollard::container::StatsOptions;
 use bollard::Docker;
+use dashmap::DashMap;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,8 @@ pub struct StatsCollector {
     docker: Arc<Docker>,
     manager: Arc<ContainerManager>,
     event_hub: Arc<EventHub>,
+    /// Track active stats collection tasks for cleanup
+    active_tasks: DashMap<String, tokio::task::AbortHandle>,
 }
 
 impl StatsCollector {
@@ -31,11 +34,25 @@ impl StatsCollector {
             docker,
             manager,
             event_hub,
+            active_tasks: DashMap::new(),
         })
+    }
+    
+    /// Stop collecting stats for a container
+    pub async fn stop_collecting(&self, internal_id: &str) {
+        tracing::info!("Stopping stats collection for container: {}", internal_id);
+        
+        // Remove and abort the active task
+        if let Some((_, handle)) = self.active_tasks.remove(internal_id) {
+            handle.abort();
+        }
     }
     
     /// Start collecting stats for a container
     pub async fn start_collecting(&self, internal_id: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Stop any existing collection for this container
+        self.stop_collecting(&internal_id).await;
+        
         // Get container state
         let state = self.manager.get_container(&internal_id).await?
             .ok_or("Container not found")?;
@@ -46,12 +63,19 @@ impl StatsCollector {
         let docker = self.docker.clone();
         let event_hub = self.event_hub.clone();
         let internal_id_clone = internal_id.clone();
+        let event_hub_check = self.event_hub.clone();
         
         // Get or create the channel
         let (channel, _) = event_hub.get_or_create_channel(&internal_id);
         
+        // Clone internal_id for the closure
+        let internal_id_for_check = internal_id_clone.clone();
+        
+        // Wrap cancellation check in Arc for thread safety
+        let is_cancelled = Arc::new(move || !event_hub_check.is_container_active(&internal_id_for_check));
+        
         // Spawn the stats collection task
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             Self::collect_stats_loop(
                 docker,
                 container_id,
@@ -59,8 +83,12 @@ impl StatsCollector {
                 event_hub,
                 channel,
                 memory_limit,
+                is_cancelled,
             ).await;
         });
+        
+        // Store the abort handle
+        self.active_tasks.insert(internal_id.clone(), handle.abort_handle());
         
         Ok(())
     }
@@ -73,6 +101,7 @@ impl StatsCollector {
         event_hub: Arc<EventHub>,
         channel: Arc<super::event_hub::ContainerEventChannel>,
         memory_limit: u64,
+        is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     ) {
         tracing::info!("Starting stats collector for container {}", internal_id);
         
@@ -83,6 +112,12 @@ impl StatsCollector {
         let mut last_system_cpu: Option<u64> = None;
         
         loop {
+            // Check if cancelled
+            if is_cancelled() {
+                tracing::info!("Stats collection cancelled for container {}", internal_id);
+                break;
+            }
+            
             // Check if container exists
             let container_info = match docker.inspect_container(&container_id, None).await {
                 Ok(info) => info,
@@ -117,6 +152,12 @@ impl StatsCollector {
             let mut stats_stream = docker.stats(&container_id, Some(stats_opts));
             
             while let Some(result) = stats_stream.next().await {
+                // Check if cancelled
+                if is_cancelled() {
+                    tracing::info!("Stats collection cancelled for container {}", internal_id);
+                    break;
+                }
+                
                 match result {
                     Ok(stats) => {
                         // Calculate CPU percentage

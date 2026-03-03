@@ -34,4 +34,6 @@ bcrypt = "0.15"
 anyhow = "1.0"
 bytes = "1.5"
 infer = "0.16"
+subtle = "2.5"
+sysinfo = "0.30"
 

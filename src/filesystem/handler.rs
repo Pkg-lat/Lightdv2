@@ -208,59 +208,188 @@ impl VolumeHandler {
 
     pub async fn decompress(&self, id: &str, root: &str, file: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         if let Some(volume) = self.get_volume(id).await {
+            // Validate the archive path using security module
+            let archive_path = security::validate_read_path(volume.get_path(), file)?;
+            
             let base_path = if root == "/" {
                 volume.get_path().to_path_buf()
             } else {
-                volume.get_path().join(root.trim_start_matches('/'))
+                security::validate_path(volume.get_path(), root.trim_start_matches('/'))?
             };
-            
-            let archive_path = base_path.join(file);
             
             if !archive_path.exists() {
                 return Err("Archive file does not exist".into());
             }
             
             let extract_path = base_path.clone();
+            // Clone paths for spawn_blocking (required for 'static lifetime)
+            let archive_path_clone = archive_path.clone();
+            let extract_path_clone = extract_path.clone();
+            let volume_root_clone = volume.get_path().to_path_buf();
             
             // Determine archive type by extension
             if file.ends_with(".zip") {
-                let extract_clone = extract_path.clone();
                 let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let file = File::open(&archive_path).map_err(|e| e.to_string())?;
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
                     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
-                    archive.extract(&extract_clone).map_err(|e| e.to_string())?;
+                    
+                    // Validate all entries before extraction to prevent zip slip
+                    for i in 0..archive.len() {
+                        let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+                        let entry_name = entry.name();
+                        
+                        // Skip directories
+                        if entry_name.ends_with('/') {
+                            continue;
+                        }
+                        
+                        // Reject absolute paths and paths with ..
+                        if entry_name.starts_with('/') || entry_name.contains("..") {
+                            return Err(format!("Malicious archive entry: {}", entry_name));
+                        }
+                        
+                        // Check if entry would escape volume
+                        let entry_path = extract_path_clone.join(entry_name);
+                        let canonical_entry = entry_path.canonicalize()
+                            .map_err(|e| format!("Failed to resolve archive entry: {}", e))?;
+                        let canonical_root = volume_root_clone.canonicalize()
+                            .map_err(|e| format!("Failed to resolve volume root: {}", e))?;
+                        
+                        if !canonical_entry.starts_with(&canonical_root) {
+                            return Err(format!("Archive entry escapes volume: {}", entry_name));
+                        }
+                    }
+                    
+                    // Now extract
+                    archive.extract(&extract_path_clone).map_err(|e| e.to_string())?;
                     Ok(())
                 }).await.map_err(|e| e.to_string())?;
                 result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 tracing::info!("Extracted ZIP archive {} in volume {}", file, id);
             } else if file.ends_with(".tar.gz") || file.ends_with(".tgz") {
-                let extract_clone = extract_path.clone();
+                let archive_path_clone = archive_path.clone();
+                let extract_path_clone = extract_path.clone();
+                let volume_root_clone = volume.get_path().to_path_buf();
                 let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let file = File::open(&archive_path).map_err(|e| e.to_string())?;
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
                     let decoder = GzDecoder::new(file);
                     let mut archive = Archive::new(decoder);
-                    archive.unpack(&extract_clone).map_err(|e| e.to_string())?;
+                    
+                    // Validate all entries before extraction
+                    for entry in archive.entries().map_err(|e| e.to_string())? {
+                        let entry = entry.map_err(|e| e.to_string())?;
+                        let entry_path = entry.path().map_err(|e| e.to_string())?;
+                        let entry_name = entry_path.to_string_lossy().into_owned();
+                        
+                        // Skip directories
+                        if entry_name.ends_with('/') || entry_name.is_empty() {
+                            continue;
+                        }
+                        
+                        // Reject absolute paths and paths with ..
+                        if entry_name.starts_with('/') || entry_name.contains("..") {
+                            return Err(format!("Malicious archive entry: {}", entry_name));
+                        }
+                        
+                        // Check if entry would escape volume
+                        let full_entry_path = extract_path_clone.join(&entry_name);
+                        let canonical_entry = full_entry_path.canonicalize()
+                            .map_err(|e| format!("Failed to resolve archive entry: {}", e))?;
+                        let canonical_root = volume_root_clone.canonicalize()
+                            .map_err(|e| format!("Failed to resolve volume root: {}", e))?;
+                        
+                        if !canonical_entry.starts_with(&canonical_root) {
+                            return Err(format!("Archive entry escapes volume: {}", entry_name));
+                        }
+                    }
+                    
+                    // Reset and extract
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
+                    let decoder = GzDecoder::new(file);
+                    let mut archive = Archive::new(decoder);
+                    archive.unpack(&extract_path_clone).map_err(|e| e.to_string())?;
                     Ok(())
                 }).await.map_err(|e| e.to_string())?;
                 result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 tracing::info!("Extracted TAR.GZ archive {} in volume {}", file, id);
             } else if file.ends_with(".tar.bz2") || file.ends_with(".tbz2") {
-                let extract_clone = extract_path.clone();
+                let archive_path_clone = archive_path.clone();
+                let extract_path_clone = extract_path.clone();
+                let volume_root_clone = volume.get_path().to_path_buf();
                 let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let file = File::open(&archive_path).map_err(|e| e.to_string())?;
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
                     let decoder = BzDecoder::new(file);
                     let mut archive = Archive::new(decoder);
-                    archive.unpack(&extract_clone).map_err(|e| e.to_string())?;
+                    
+                    // Validate all entries before extraction
+                    for entry in archive.entries().map_err(|e| e.to_string())? {
+                        let entry = entry.map_err(|e| e.to_string())?;
+                        let entry_path = entry.path().map_err(|e| e.to_string())?;
+                        let entry_name = entry_path.to_string_lossy().into_owned();
+                        
+                        if entry_name.ends_with('/') || entry_name.is_empty() {
+                            continue;
+                        }
+                        
+                        if entry_name.starts_with('/') || entry_name.contains("..") {
+                            return Err(format!("Malicious archive entry: {}", entry_name));
+                        }
+                        
+                        let full_entry_path = extract_path_clone.join(&entry_name);
+                        let canonical_entry = full_entry_path.canonicalize()
+                            .map_err(|e| format!("Failed to resolve archive entry: {}", e))?;
+                        let canonical_root = volume_root_clone.canonicalize()
+                            .map_err(|e| format!("Failed to resolve volume root: {}", e))?;
+                        
+                        if !canonical_entry.starts_with(&canonical_root) {
+                            return Err(format!("Archive entry escapes volume: {}", entry_name));
+                        }
+                    }
+                    
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
+                    let decoder = BzDecoder::new(file);
+                    let mut archive = Archive::new(decoder);
+                    archive.unpack(&extract_path_clone).map_err(|e| e.to_string())?;
                     Ok(())
                 }).await.map_err(|e| e.to_string())?;
                 result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 tracing::info!("Extracted TAR.BZ2 archive {} in volume {}", file, id);
             } else if file.ends_with(".tar") {
-                let extract_clone = extract_path.clone();
+                let archive_path_clone = archive_path.clone();
+                let extract_path_clone = extract_path.clone();
+                let volume_root_clone = volume.get_path().to_path_buf();
                 let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let file = File::open(&archive_path).map_err(|e| e.to_string())?;
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
                     let mut archive = Archive::new(file);
-                    archive.unpack(&extract_clone).map_err(|e| e.to_string())?;
+                    
+                    // Validate all entries before extraction
+                    for entry in archive.entries().map_err(|e| e.to_string())? {
+                        let entry = entry.map_err(|e| e.to_string())?;
+                        let entry_path = entry.path().map_err(|e| e.to_string())?;
+                        let entry_name = entry_path.to_string_lossy().into_owned();
+                        
+                        if entry_name.ends_with('/') || entry_name.is_empty() {
+                            continue;
+                        }
+                        
+                        if entry_name.starts_with('/') || entry_name.contains("..") {
+                            return Err(format!("Malicious archive entry: {}", entry_name));
+                        }
+                        
+                        let full_entry_path = extract_path_clone.join(&entry_name);
+                        let canonical_entry = full_entry_path.canonicalize()
+                            .map_err(|e| format!("Failed to resolve archive entry: {}", e))?;
+                        let canonical_root = volume_root_clone.canonicalize()
+                            .map_err(|e| format!("Failed to resolve volume root: {}", e))?;
+                        
+                        if !canonical_entry.starts_with(&canonical_root) {
+                            return Err(format!("Archive entry escapes volume: {}", entry_name));
+                        }
+                    }
+                    
+                    let file = File::open(&archive_path_clone).map_err(|e| e.to_string())?;
+                    let mut archive = Archive::new(file);
+                    archive.unpack(&extract_path_clone).map_err(|e| e.to_string())?;
                     Ok(())
                 }).await.map_err(|e| e.to_string())?;
                 result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -279,17 +408,15 @@ impl VolumeHandler {
         if let Some(volume) = self.get_volume(id).await {
             let volume_path = volume.get_path().to_path_buf();
             
-            // Validate all source paths exist
+            // Validate all source paths using security module
             let mut source_paths = Vec::new();
             for source in &sources {
-                let path = volume_path.join(source.trim_start_matches('/'));
-                if !path.exists() {
-                    return Err(format!("Source path does not exist: {}", source).into());
-                }
+                let path = security::validate_read_path(&volume_path, source.trim_start_matches('/'))?;
                 source_paths.push(path);
             }
             
-            let output_path = volume_path.join(output.trim_start_matches('/'));
+            // Validate output path using security module
+            let output_path = security::validate_write_path(&volume_path, output.trim_start_matches('/'))?;
             
             // Ensure output directory exists
             if let Some(parent) = output_path.parent() {

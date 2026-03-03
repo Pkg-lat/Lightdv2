@@ -7,7 +7,8 @@ const TOKEN = 'lightd_ad2f7fc49ed640429c450e14ed07c8d5';
 const headers = {
     'Authorization': `Bearer ${TOKEN}`,
     'Accept': 'Application/vnd.pkglatv1+json',
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Origin': 'http://localhost:3000'  // Add this
 };
 
 async function testSftpCredentials() {

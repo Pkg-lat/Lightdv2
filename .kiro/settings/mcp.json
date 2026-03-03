@@ -1,0 +1,8 @@
+{
+	"mcpServers": {
+		"pkg-lat-docs": {
+			"url": "https://docs.pkg.lat/mcp",
+			"type": "http"
+		}
+	}
+}

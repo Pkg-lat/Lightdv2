@@ -196,7 +196,14 @@ async fn handle_socket(socket: WebSocket, internal_id: String, state: WebSocketS
         }
     }
     
-    tracing::info!("WebSocket disconnected for container: {}", internal_id);
+    // Clean up streaming tasks when WebSocket disconnects
+    tracing::info!("WebSocket disconnected for container: {}, cleaning up...", internal_id);
+    
+    // Stop console streaming
+    state.console_streamer.stop_streaming(&internal_id).await;
+    
+    // Stop stats collection
+    state.stats_collector.stop_collecting(&internal_id).await;
 }
 
 /// Handle an inbound event from the client

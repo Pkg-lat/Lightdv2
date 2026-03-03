@@ -4,6 +4,7 @@
 
 use bollard::container::{AttachContainerOptions, LogsOptions, LogOutput};
 use bollard::Docker;
+use dashmap::DashMap;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +49,8 @@ pub struct ConsoleStreamer {
     docker: Arc<Docker>,
     manager: Arc<ContainerManager>,
     event_hub: Arc<EventHub>,
+    /// Track active streaming tasks for cleanup
+    active_tasks: DashMap<String, tokio::task::AbortHandle>,
 }
 
 #[allow(unused_mut)]
@@ -62,11 +65,30 @@ impl ConsoleStreamer {
             docker,
             manager,
             event_hub,
+            active_tasks: DashMap::new(),
         })
+    }
+    
+    /// Stop streaming for a container (called when WebSocket disconnects or container deleted)
+    pub async fn stop_streaming(&self, internal_id: &str) {
+        tracing::info!("Stopping console streaming for container: {}", internal_id);
+        
+        // Remove and abort the active task
+        if let Some((_, handle)) = self.active_tasks.remove(internal_id) {
+            handle.abort();
+        }
+        
+        // Update state to offline
+        if let Some(channel) = self.event_hub.get_channel(internal_id) {
+            channel.set_state(ContainerRuntimeState::Offline).await;
+        }
     }
     
     /// Start streaming for a container (called when WebSocket connects)
     pub async fn start_streaming(&self, internal_id: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Stop any existing streaming for this container
+        self.stop_streaming(&internal_id).await;
+        
         // Get container state
         let state = self.manager.get_container(&internal_id).await?
             .ok_or("Container not found")?;
@@ -77,12 +99,19 @@ impl ConsoleStreamer {
         let docker = self.docker.clone();
         let event_hub = self.event_hub.clone();
         let internal_id_clone = internal_id.clone();
+        let event_hub_check = self.event_hub.clone();
         
         // Get or create the channel
         let (_channel, mut command_rx) = event_hub.get_or_create_channel(&internal_id);
         
+        // Clone internal_id for the closure
+        let internal_id_for_check = internal_id_clone.clone();
+        
+        // Wrap cancellation check in Arc for thread safety
+        let is_cancelled = Arc::new(move || !event_hub_check.is_container_active(&internal_id_for_check));
+        
         // Spawn the streaming task
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             Self::stream_logs_attached(
                 docker,
                 container_id,
@@ -90,8 +119,12 @@ impl ConsoleStreamer {
                 event_hub,
                 command_rx,
                 start_pattern,
+                is_cancelled,
             ).await;
         });
+        
+        // Store the abort handle
+        self.active_tasks.insert(internal_id.clone(), handle.abort_handle());
         
         Ok(())
     }
@@ -104,6 +137,7 @@ impl ConsoleStreamer {
         event_hub: Arc<EventHub>,
         mut input_rx: mpsc::UnboundedReceiver<String>,
         start_pattern: Option<String>,
+        is_cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
     ) {
         let mut last_line: Option<String> = None;
         let mut duplicate_count: u32 = 0;
@@ -120,9 +154,16 @@ impl ConsoleStreamer {
         let docker_input = docker.clone();
         let cid_input = container_id.clone();
         let internal_id_input = internal_id.clone();
+        let is_cancelled_stdin = is_cancelled.clone();
         
         let _stdin_task = tokio::spawn(async move {
             loop {
+                // Check if cancelled
+                if is_cancelled_stdin() {
+                    tracing::info!("Stdin task cancelled for {}", internal_id_input);
+                    break;
+                }
+                
                 // Wait for container to be running before attaching for stdin
                 if !is_container_running(&docker_input, &cid_input).await {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -173,6 +214,12 @@ impl ConsoleStreamer {
         let mut log_count: u64 = 0;
 
         loop {
+            // Check if cancelled
+            if is_cancelled() {
+                tracing::info!("Log streaming cancelled for container {}", internal_id);
+                break;
+            }
+            
             // Check if container exists and is running
             let running = is_container_running(&docker, &container_id).await;
             
@@ -233,6 +280,12 @@ impl ConsoleStreamer {
             let mut log_stream = docker.logs(&container_id, Some(log_opts));
 
             while let Some(result) = log_stream.next().await {
+                // Check if cancelled
+                if is_cancelled() {
+                    tracing::info!("Log streaming cancelled for container {}", internal_id);
+                    break;
+                }
+                
                 match result {
                     Ok(log_output) => {
                         let message_bytes = match log_output {
