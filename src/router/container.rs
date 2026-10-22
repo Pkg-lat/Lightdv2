@@ -293,22 +293,17 @@ async fn create_container(
                 let mut assigned_ports = Vec::new();
                 
                 for request in port_requests {
-                    // Get random available port from pool
-                    match state.pool.get_random_available().await {
+                    // Claim a port atomically. Reserving and marking separately let
+                    // two concurrent creations be handed the same host port.
+                    match state.pool.reserve_port_for(&payload.internal_id).await {
                         Ok(Some(network_port)) => {
-                            // Mark port as in use
-                            if let Err(e) = state.pool.mark_in_use(&network_port.id, true).await {
-                                tracing::error!("Failed to mark port {} as in use: {}", network_port.id, e);
-                                continue;
-                            }
-                            
                             // Create port binding
                             let binding = PortBinding {
                                 container_port: request.container_port,
                                 host_port: network_port.port,
                                 protocol: request.protocol,
                             };
-                            
+
                             assigned_ports.push(binding);
                             tracing::info!("Assigned port {} -> {} for container {}", 
                                 request.container_port, network_port.port, payload.internal_id);
@@ -516,26 +511,22 @@ async fn delete_container(
         return response;
     }
 
-    // Get container to check for ports before deletion
-    if let Ok(Some(container)) = state.manager.get_container(&id).await {
-        // Return ports to pool
-        for port_binding in &container.ports {
-            // Find the port in the pool by host_port and mark as available
-            if let Ok(all_ports) = state.pool.get_all_ports().await {
-                for network_port in all_ports {
-                    if network_port.port == port_binding.host_port && network_port.in_use {
-                        if let Err(e) = state.pool.mark_in_use(&network_port.id, false).await {
-                            tracing::error!("Failed to return port {} to pool: {}", network_port.port, e);
-                        } else {
-                            tracing::info!("Returned port {} to pool", network_port.port);
-                        }
-                        break;
-                    }
-                }
+    // Return this container's ports to the pool.
+    //
+    // Previously this scanned every pool entry and released the first whose port
+    // number matched a binding, so when two containers shared a port it released
+    // whichever it found first — possibly the other container's, or its own while
+    // leaving the other claimed. Ports are now released by the container that
+    // holds them.
+    match state.pool.return_ports_for(&id).await {
+        Ok(released) => {
+            for port in released {
+                tracing::info!("Returned port {} to pool on container delete", port.port);
             }
         }
+        Err(e) => tracing::error!("Failed to return ports for {}: {}", id, e),
     }
-    
+
     match state.manager.delete_container(&id).await {
         Ok(container) => (StatusCode::OK, Json(container)).into_response(),
         Err(e) => (

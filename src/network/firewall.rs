@@ -62,7 +62,7 @@ impl FirewallManager {
     pub fn new(db_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let db = sled::open(db_path)?;
         let rules = Arc::new(RwLock::new(Vec::new()));
-        
+
         // Load existing rules from database
         let mut loaded_rules = Vec::new();
         for item in db.iter() {
@@ -73,16 +73,47 @@ impl FirewallManager {
                 loaded_rules.push(rule);
             }
         }
-        
+
         if !loaded_rules.is_empty() {
             tracing::info!("Loaded {} firewall rules from database", loaded_rules.len());
             *rules.blocking_write() = loaded_rules;
         }
-        
+
         Ok(Self {
             db: Arc::new(db),
             rules,
         })
+    }
+
+    /// Re-apply every persisted, enabled rule to the kernel.
+    ///
+    /// iptables rules live in the kernel, not in sled, so they are gone after a
+    /// restart while the database still says `enabled: true`. Without this the API
+    /// reports rules as active that no packet ever matches — a security control
+    /// that silently does nothing. Call once at startup.
+    pub async fn reapply_persisted_rules(&self) {
+        let rules = self.rules.read().await.clone();
+        let mut applied = 0;
+        let mut failed = 0;
+
+        for rule in rules.iter().filter(|r| r.enabled) {
+            match self.apply_iptables_rule(rule, true).await {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::error!(rule_id = %rule.id, error = %e, "Failed to reapply firewall rule");
+                }
+            }
+        }
+
+        if applied > 0 || failed > 0 {
+            // Loud on failure: the operator needs to know enforcement did not resume.
+            tracing::info!(
+                "Reapplied {} persisted firewall rule(s) at startup ({} failed)",
+                applied,
+                failed
+            );
+        }
     }
     
     /// Create a custom Docker bridge network for a container
@@ -91,24 +122,26 @@ impl FirewallManager {
         container_id: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let network_name = format!("lightd-net-{}", container_id);
-        
+
         // Check if network already exists
         let check = Command::new("docker")
             .args(&["network", "inspect", &network_name])
             .output();
-        
+
         if check.is_ok() && check.unwrap().status.success() {
             tracing::info!("Network {} already exists", network_name);
             return Ok(network_name);
         }
-        
-        // Create isolated bridge network
+
+        // Do NOT set com.docker.network.bridge.name. A single hardcoded name was
+        // used for every container's network, so the second network collided with
+        // the first and the isolation this function claims did not hold. Docker's
+        // generated per-network bridge name avoids that.
         let output = Command::new("docker")
             .args(&[
                 "network", "create",
                 "--driver", "bridge",
                 "--internal=false",
-                "--opt", "com.docker.network.bridge.name=lightd0",
                 &network_name,
             ])
             .output()?;

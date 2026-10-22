@@ -149,6 +149,11 @@ async fn main_app(timer: Timer) {
     let firewall_db_path = format!("{}/firewall.db", config.storage.base_path);
     let firewall_manager = Arc::new(network::firewall::FirewallManager::new(&firewall_db_path)
         .expect("Failed to initialize firewall manager"));
+
+    // iptables rules do not survive a restart, but the database still records them
+    // as enabled. Re-apply before serving traffic so the API does not report rules
+    // as active that no packet matches.
+    firewall_manager.reapply_persisted_rules().await;
     
     // Initialize container manager
     let containers_db_path = format!("{}/containers.db", config.storage.base_path);
