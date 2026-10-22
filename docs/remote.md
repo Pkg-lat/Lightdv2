@@ -11,7 +11,7 @@ Enable remote sync in `config.json`:
   "remote": {
     "enabled": true,
     "url": "https://your-remote-api.com/api",
-    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+    "token": "lightd_your_token_here"
   }
 }
 ```

@@ -9,7 +9,7 @@ Tokens must follow this format:
 lightd_<random-string>
 ```
 
-Example: `lightd_ad2f7fc49ed640429c450e14ed07c8d5`
+Example: `lightd_your_token_here`
 
 ## Required Headers
 
@@ -30,7 +30,7 @@ Accept: Application/vnd.pkglatv1+json
 
 **Output:**
 ```
-Current Token: lightd_ad2f7fc49ed640429c450e14ed07c8d5
+Current Token: lightd_your_token_here
 ```
 
 ### Generate New Random Token
@@ -72,7 +72,7 @@ Tokens are stored in `config.json`:
 {
   "authorization": {
     "enabled": true,
-    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+    "token": "lightd_your_token_here"
   }
 }
 ```
@@ -145,7 +145,7 @@ These routes don't require authentication:
 
 ```bash
 curl -X GET http://localhost:8070/volumes \
-  -H "Authorization: Bearer lightd_ad2f7fc49ed640429c450e14ed07c8d5" \
+  -H "Authorization: Bearer lightd_your_token_here" \
   -H "Accept: Application/vnd.pkglatv1+json"
 ```
 

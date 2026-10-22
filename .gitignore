@@ -9,3 +9,6 @@ docs
 storage-old
 /Lightd
 Lightd
+# Local configuration — contains the API token. Never commit.
+# Copy config.example.json to config.json and fill in your own values.
+config.json

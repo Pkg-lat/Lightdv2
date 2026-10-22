@@ -483,7 +483,7 @@ Complete examples of all API responses for reference.
   },
   "authorization": {
     "enabled": true,
-    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+    "token": "lightd_your_token_here"
   },
   "docker": {
     "socket_path": "/var/run/docker.sock"
@@ -496,7 +496,7 @@ Complete examples of all API responses for reference.
   "remote": {
     "enabled": true,
     "url": "https://remote-api.com/api",
-    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+    "token": "lightd_your_token_here"
   }
 }
 ```
