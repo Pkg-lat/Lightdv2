@@ -410,6 +410,7 @@ async fn main_app(timer: Timer) {
         console_streamer,
         stats_collector,
         token_manager: token_manager.clone(),
+        api_token: config.authorization.token.clone(),
     };
     
     // Setup routers
@@ -428,7 +429,7 @@ async fn main_app(timer: Timer) {
     );
     
     // Create auth config for middleware
-    let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config));
+    let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config, token_manager.clone()));
 
     // Tokens are minted only by an authenticated caller. Previously this router was
     // mounted bare, so any unauthenticated client could mint a token and then satisfy
@@ -455,9 +456,16 @@ async fn main_app(timer: Timer) {
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     
     // WebSocket route
+    //
+    // The handler authenticates from a query token during the upgrade, so it cannot
+    // run auth_middleware. Handlers under this router still need a Principal to
+    // authorize against, so inject the admin identity here — see
+    // admin_principal_middleware, which documents why this is safe *only* for a
+    // router that authenticates its own requests.
     let ws_routes = Router::new()
         .route("/ws/:id", get(websocket::ws_handler))
-        .with_state(ws_state);
+        .with_state(ws_state)
+        .layer(middleware::from_fn(auth::middleware::admin_principal_middleware));
     
     // Build CORS layer based on allowed origins from config
     // Wildcard origins combined with credentials are not emitted: an invalid origin

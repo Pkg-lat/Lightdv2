@@ -38,10 +38,11 @@ impl ContainerManager {
         internal_id: String,
         volume_id: String,
         startup_command: String,
+        owner: String,
     ) -> Result<ContainerState, Box<dyn std::error::Error + Send + Sync>> {
         let _lock = self.states.write().await;
 
-        let mut state = ContainerState::new(internal_id.clone(), volume_id, startup_command);
+        let mut state = ContainerState::new(internal_id.clone(), volume_id, startup_command, owner);
         state.is_installing = true;
         state.install_state = InstallState::Installing;
 

@@ -1,6 +1,7 @@
 //! Authentication middleware for API routes
-//! 
-//! Validates Bearer tokens and vendor headers.
+//!
+//! Validates the Bearer token and vendor header, then injects a `Principal`
+//! describing who the caller is so handlers can authorize against it.
 
 use axum::{
     extract::{Request, State},
@@ -11,19 +12,23 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::auth::principal::{secret_eq, Principal};
+use crate::auth::tokens::TokenManager;
 use crate::config::config::Config;
 
 #[derive(Clone)]
 pub struct AuthConfig {
     pub api_token: String,
     pub allowed_origins: Vec<String>,
+    pub token_manager: Arc<TokenManager>,
 }
 
 impl AuthConfig {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config, token_manager: Arc<TokenManager>) -> Self {
         Self {
             api_token: config.authorization.token.clone(),
             allowed_origins: config.authorization.allowed_origins.clone(),
+            token_manager,
         }
     }
 }
@@ -46,38 +51,48 @@ fn validate_vendor(headers: &HeaderMap) -> bool {
     false
 }
 
-/// Extract and validate Bearer token with constant-time comparison
-fn validate_bearer_token(headers: &HeaderMap, api_token: &str) -> bool {
-    if let Some(auth) = headers.get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                // Constant-time comparison for security
-                use subtle::ConstantTimeEq;
-                
-                // Check if token starts with "lightd_"
-                if !token.starts_with("lightd_") {
-                    return false;
-                }
-                
-                // Constant-time comparison
-                let token_bytes = token.as_bytes();
-                let api_token_bytes = api_token.as_bytes();
-                
-                // Use constant-time comparison
-                if token_bytes.ct_eq(api_token_bytes).into() {
-                    return true;
-                }
+/// Resolve the caller's identity from the Authorization header.
+///
+/// The master token from config (or the `LIGHTD_API_TOKEN` environment variable)
+/// acts as admin. A token minted through `/auth/tokens` acts as the tenant it was
+/// issued for. Returns `None` for anything unrecognized.
+fn resolve_principal(headers: &HeaderMap, auth_config: &AuthConfig) -> Option<Principal> {
+    let auth = headers.get("authorization")?;
+    let auth_str = auth.to_str().ok()?;
+    let token = auth_str.strip_prefix("Bearer ")?;
+
+    // Master token => admin. Constant-time compare for the config token.
+    //
+    // The env var is checked too: with config.json no longer committed, deployments
+    // need a way to supply the token without a file on disk.
+    let config_token = std::env::var("LIGHTD_API_TOKEN").unwrap_or_else(|_| auth_config.api_token.clone());
+    if !config_token.is_empty() && secret_eq(token, &config_token) {
+        return Some(Principal::admin());
+    }
+
+    // Minted token => tenant (or admin, when minted with the system owner).
+    match auth_config.token_manager.validate_token(token, false) {
+        Ok(Some(data)) => {
+            if data.is_admin() {
+                Some(Principal::admin())
+            } else {
+                Some(Principal::tenant(data.owner))
             }
         }
+        Ok(None) => None,
+        Err(e) => {
+            // Never echo the token here — a malformed input drives this path.
+            tracing::error!("Token validation failed: {}", e);
+            None
+        }
     }
-    false
 }
 
 /// Authentication middleware
 pub async fn auth_middleware(
     State(auth_config): State<Arc<AuthConfig>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // Check origin
@@ -90,7 +105,7 @@ pub async fn auth_middleware(
             }))
         ).into_response();
     }
-    
+
     // Check vendor
     if !validate_vendor(&headers) {
         return (
@@ -100,16 +115,94 @@ pub async fn auth_middleware(
             }))
         ).into_response();
     }
-    
-    // Check Bearer token
-    if !validate_bearer_token(&headers, &auth_config.api_token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({
-                "error": "Invalid or missing Bearer token. Format: Authorization: Bearer lightd_<token>"
-            }))
-        ).into_response();
-    }
-    
+
+    // Resolve identity. The failure response deliberately does not repeat the
+    // expected token format or value.
+    let principal = match resolve_principal(&headers, &auth_config) {
+        Some(principal) => principal,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({
+                    "error": "Invalid or missing credentials"
+                }))
+            ).into_response();
+        }
+    };
+
+    // Hand the identity to the handler.
+    request.extensions_mut().insert(principal);
+
     next.run(request).await
+}
+
+/// Inject an admin `Principal` into every request, without authenticating.
+///
+/// This exists solely for routers that validate their own credentials and cannot
+/// run `auth_middleware` — the WebSocket handler, which authenticates from a query
+/// parameter during the upgrade.
+///
+/// The point is that *every* router ends up holding a `Principal` extension, so
+/// the extractor fails at compile time when one is missing rather than silently
+/// granting access. Authenticate separately; do not treat reaching a handler as
+/// proof of identity.
+pub async fn admin_principal_middleware(mut request: Request, next: Next) -> Response {
+    request.extensions_mut().insert(Principal::admin());
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::principal::Role;
+    use axum::http::header::AUTHORIZATION;
+
+    fn test_auth_config() -> AuthConfig {
+        let dir = std::env::temp_dir().join(format!("lightd_auth_test_{}", uuid::Uuid::new_v4()));
+        let manager = Arc::new(TokenManager::new(&dir.join("tokens.db").to_string_lossy()).unwrap());
+        AuthConfig {
+            api_token: "lightd_master_token_value".to_string(),
+            allowed_origins: Vec::new(),
+            token_manager: manager,
+        }
+    }
+
+    fn headers_with(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {}", token).parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn master_token_is_admin() {
+        let config = test_auth_config();
+        let principal = resolve_principal(&headers_with("lightd_master_token_value"), &config).unwrap();
+        assert_eq!(principal.role, Role::Admin);
+    }
+
+    #[test]
+    fn minted_token_is_scoped_to_its_owner() {
+        let config = test_auth_config();
+        let token = config
+            .token_manager
+            .generate_token_for("alice".to_string(), 3600, false)
+            .unwrap();
+
+        let principal = resolve_principal(&headers_with(&token), &config).unwrap();
+        assert_eq!(principal.role, Role::Tenant("alice".to_string()));
+        assert!(!principal.is_admin());
+    }
+
+    #[test]
+    fn unknown_token_is_rejected() {
+        let config = test_auth_config();
+        assert!(resolve_principal(&headers_with("lightd_nope"), &config).is_none());
+        assert!(resolve_principal(&headers_with("not-even-prefixed"), &config).is_none());
+    }
+
+    #[test]
+    fn missing_authorization_header_is_rejected() {
+        let config = test_auth_config();
+        assert!(resolve_principal(&HeaderMap::new(), &config).is_none());
+    }
 }
