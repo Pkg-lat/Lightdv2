@@ -1,6 +1,28 @@
 # Container Firewall System
 
-The firewall system provides DDoS protection and security rules for containers using Docker's custom bridge networks and iptables. Each container gets its own isolated network, completely separate from the host network.
+> ## ⚠️ Enforcement status — read before relying on this
+>
+> This subsystem is **partially implemented**. Rules are created, validated,
+> stored, and applied to iptables chains, and they are now re-applied at startup.
+> However:
+>
+> - **Per-container rules are not attached to the container's traffic path.**
+>   The `LIGHTD-*` chains are created but never jumped to from `FORWARD`, `INPUT`,
+>   or any Docker chain, and the per-container networks created here are not
+>   attached to the container — `container/network.rs` builds the container config
+>   with no `networking_config`, so the container runs on Docker's default bridge.
+> - **DDoS protection does not enforce anything on its own.** `POST /firewall/ddos/:id`
+>   returns success and stores configuration; the SYN-flood, connection-limit and
+>   rate-limit chains it creates are never referenced.
+>
+> The endpoints behave as documented below, but a rule reported as `enabled` is not
+> currently blocking traffic. Track this as unfinished work, not as a working
+> security control.
+>
+> Also note the "isolated network" wording below is aspirational for the same
+> reason: isolation requires attaching the network, which does not happen yet.
+
+The firewall system applies DDoS protection and security rules for containers using Docker bridge networks and iptables.
 
 ## Features
 
@@ -13,10 +35,13 @@ The firewall system provides DDoS protection and security rules for containers u
 
 ## Security
 
-- **Host Network Isolation**: Container networks are completely isolated from host
-- **No Host Abuse**: Firewall rules only apply to container traffic
-- **iptables Integration**: Uses Linux kernel firewall for maximum security
-- **Persistent Rules**: All rules stored in database and survive restarts
+- **iptables Integration**: Uses the Linux kernel firewall
+- **Persistent Rules**: All rules are stored in the database and re-applied to
+  iptables on daemon restart. (iptables state lives in the kernel and does not
+  survive a reboot, so a rule can only be considered active once the daemon has
+  started and reapplied it.)
+- **Rule validation**: Protocols are constrained to a closed set, and source/dest
+  ports are range-checked before any rule reaches iptables.
 
 ## API Endpoints
 
@@ -330,7 +355,7 @@ Firewall rules are organized in iptables chains:
 
 ### Persistence
 
-All firewall rules and DDoS configurations are stored in `storage/firewall.db` using sled database. Rules are automatically reloaded on daemon restart.
+All firewall rules and DDoS configurations are stored in `storage/firewall.db` using sled database. On startup the daemon reloads them **and re-applies enabled rules to iptables**, because kernel firewall state does not persist across a restart. Failures to re-apply are logged at error level.
 
 ## Limitations
 
@@ -341,8 +366,10 @@ All firewall rules and DDoS configurations are stored in `storage/firewall.db` u
 
 ## Security Considerations
 
-- Firewall rules are enforced by the Linux kernel
-- Container cannot bypass its own firewall rules
-- Host network is completely isolated from container networks
-- All iptables commands are validated before execution
-- No direct host network access is possible
+- iptables commands are invoked with arguments passed directly to argv, never
+  through a shell, so rule values cannot inject shell syntax
+- Ports are deserialized as `u16` and protocols come from a closed enum, so
+  malformed or out-of-range values are rejected before reaching the OS
+- **Not yet true (see the status note at the top):** rules being enforced on
+  container traffic, DDoS protection taking effect, and container networks being
+  isolated from the host and from each other

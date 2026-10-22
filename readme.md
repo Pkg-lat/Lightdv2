@@ -20,12 +20,25 @@ This version aims for a simpler, stateless remote based arch.
 ## Quick Start
 
 ```bash
+# Create your local config (contains the API token — it is gitignored)
+cp config.example.json config.json
+
+# Generate a token and put it in config.json, or export it
+export LIGHTD_API_TOKEN=lightd_...
+
 # Build and run
 make run
 
 # Test SFTP
 node tests/sftp.js
 ```
+
+`config.json` is **not** committed and must not be: it holds the master API token,
+which authenticates every route. A leaked token grants full control of the daemon
+and all containers. Use `config.example.json` as the template, and rotate the token
+with `./lightd --token reset` if one is ever exposed.
+
+Test scripts read `LIGHTD_API_TOKEN` from the environment.
 
 ## Documentation
 
