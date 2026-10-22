@@ -211,6 +211,31 @@ pub async fn auth_middleware(
     next.run(request).await
 }
 
+/// Reject any caller that is not an admin.
+///
+/// For routers operating on host-wide infrastructure rather than owned resources:
+/// the port pool, firewall rules, billing records and the network rebinder. These
+/// have no per-owner mapping in the data model, so rather than leaving them open to
+/// every tenant token — which allowed one tenant to free another's port, or read
+/// another's billing — they are admin-only until they can be scoped properly.
+///
+/// Must be layered *after* `auth_middleware`, which is what inserts the Principal.
+pub async fn require_admin_middleware(
+    request: Request,
+    next: Next,
+) -> Response {
+    match request.extensions().get::<Principal>() {
+        Some(principal) if principal.is_admin() => next.run(request).await,
+        _ => (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "error": "This endpoint requires an admin token"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Inject an admin `Principal` into every request, without authenticating.
 ///
 /// This exists solely for routers that validate their own credentials and cannot

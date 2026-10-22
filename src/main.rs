@@ -479,11 +479,18 @@ async fn main_app(timer: Timer) {
     // Protected routes with auth middleware
     let filesystem_routes = router::filesystem::volume_router(volume_handler)
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+    // Port pool / firewall / billing act on host-wide infrastructure with no
+    // per-owner mapping, so they require an admin token. require_admin_middleware
+    // is layered before auth_middleware because the last layer added runs first:
+    // auth must run first so the Principal exists when require_admin inspects it.
     let network_routes = router::network::network_router(network_pool.clone())
+        .layer(middleware::from_fn(auth::middleware::require_admin_middleware))
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let firewall_protected_routes = firewall_routes
+        .layer(middleware::from_fn(auth::middleware::require_admin_middleware))
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let billing_protected_routes = billing_routes
+        .layer(middleware::from_fn(auth::middleware::require_admin_middleware))
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let sftp_protected_routes = sftp_routes
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));

@@ -935,6 +935,20 @@ async fn rebind_network(
         return response;
     }
 
+    // Rebind takes a caller-supplied host port list which is not validated against
+    // the pool (host ports can be arbitrary, and the requested ports are not
+    // checked for availability or ownership), so a tenant could bind host :22 or
+    // steal another container's port. Restricted to admin until port requests are
+    // resolved through the pool.
+    if !principal.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Network rebinding requires an admin token".to_string(),
+            }),
+        ).into_response();
+    }
+
     match state.network.rebind_ports(id.clone(), payload.ports, payload.image).await {
         Ok(_) => (
             StatusCode::OK,
