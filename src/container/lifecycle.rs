@@ -10,6 +10,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Identity the container workload runs as, once installation has finished.
+///
+/// Numeric rather than a name so it resolves inside any image, including ones
+/// without a matching passwd entry. Keep in step with `LIGHTD_UID`/`LIGHTD_GID`
+/// in container/user.rs.
+const LIGHTD_RUNTIME_USER: &str = "1000:1000";
+
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub enum LifecycleEvent {
@@ -384,27 +391,31 @@ impl LifecycleManager {
         let entrypoint_path = container_data_path.join("entrypoint.sh");
         tokio::fs::write(&entrypoint_path, "#!/bin/sh\necho 'Container initializing...'\nsleep infinity\n").await?;
 
-        // For install phase, run as root. Will be recreated with lightd+ user after install
-        let container_user_config = None;  // Always run as root
-
-        let config = Config {
+        // For the install phase, run as root: the image's own setup may need
+        // privileged access. The runtime config below is the same container with
+        // the user dropped, and is used to recreate it once install finishes.
+        let install_config = Config {
             image: Some(image.clone()),
             working_dir: Some("/home/container".to_string()),
             host_config: Some(host_config),
             entrypoint: Some(vec!["/bin/sh".to_string(), "/app/data/entrypoint.sh".to_string()]),
-            user: container_user_config,
+            user: None,
             tty: Some(true),
             open_stdin: Some(true),
             exposed_ports: if exposed_ports.is_empty() { None } else { Some(exposed_ports) },
             ..Default::default()
         };
 
+        // The runtime identity. Containers must not keep root for the workload.
+        let mut runtime_config = install_config.clone();
+        runtime_config.user = Some(LIGHTD_RUNTIME_USER.to_string());
+
         let options = CreateContainerOptions {
             name: container_name.clone(),
             ..Default::default()
         };
 
-        let container = docker.create_container(Some(options), config).await?;
+        let container = docker.create_container(Some(options), install_config).await?;
         let container_id = container.id;
 
         let _ = event_tx.send(LifecycleEvent::ContainerCreated(
@@ -513,6 +524,28 @@ impl LifecycleManager {
         );
         tokio::fs::write(&entrypoint_path, final_entrypoint).await?;
 
+        // Drop privileges for the runtime phase.
+        //
+        // The install phase deliberately runs as root so the image's own setup can
+        // do privileged work. That was supposed to be followed by a recreation as
+        // the unprivileged `lightd+` user, but the container was never recreated —
+        // the comment said "Always run as root" and that is what shipped, so every
+        // tenant workload kept root inside the container.
+        //
+        // The user field is fixed at container creation, so honouring it requires
+        // recreating the container. Mutable state is safe: /home/container and
+        // /app/data are bind mounts, not writable layers, and the entrypoint on disk
+        // is what the new container will exec.
+        let container_id = Self::recreate_container_unprivileged(
+            &docker,
+            &container_name,
+            runtime_config,
+            container_id,
+            &event_tx,
+            &internal_id,
+        )
+        .await?;
+
         // Mark as ready in database
         manager.mark_ready(&internal_id, container_id.clone()).await?;
         let _ = event_tx.send(LifecycleEvent::Ready(internal_id.clone()));
@@ -548,6 +581,73 @@ impl LifecycleManager {
 
     /// Reinstall a container with a new install script
     /// This will remove the existing Docker container and create a new one
+    /// Recreate a container with its runtime (non-root) user, returning the new id.
+    ///
+    /// `Config.user` is immutable once a container exists, so honouring the
+    /// unprivileged runtime identity requires deleting and recreating the
+    /// container. Bind mounts mean the tenant's data is unaffected, and the
+    /// entrypoint is read from disk at start time.
+    ///
+    /// On failure the original container is left running, because keeping a working
+    /// (if privileged) container is better than leaving the tenant with none.
+    async fn recreate_container_unprivileged(
+        docker: &Docker,
+        container_name: &str,
+        runtime_config: Config<String>,
+        old_container_id: String,
+        event_tx: &mpsc::UnboundedSender<LifecycleEvent>,
+        internal_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // Already stopped by the caller; be explicit so recreation cannot fail on a
+        // container that is still running.
+        let _ = docker.stop_container(&old_container_id, None).await;
+
+        if let Err(e) = docker
+            .remove_container(
+                &old_container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            tracing::error!(
+                container_id = %internal_id,
+                error = %e,
+                "Failed to remove privileged container; leaving it in place"
+            );
+            return Ok(old_container_id);
+        }
+
+        let options = CreateContainerOptions {
+            name: container_name.to_string(),
+            ..Default::default()
+        };
+
+        match docker.create_container(Some(options), runtime_config).await {
+            Ok(created) => {
+                let _ = event_tx.send(LifecycleEvent::ContainerCreated(
+                    internal_id.to_string(),
+                    created.id.clone(),
+                ));
+                tracing::info!(
+                    container_id = %internal_id,
+                    "Recreated container as unprivileged user {}",
+                    LIGHTD_RUNTIME_USER
+                );
+                Ok(created.id)
+            }
+            Err(e) => {
+                // The original container is already deleted at this point, so there
+                // is nothing to fall back to. Surface it as an error so the container
+                // is marked failed rather than reported ready with no container.
+                tracing::error!(container_id = %internal_id, error = %e, "Failed to recreate container");
+                Err(format!("Failed to recreate container as unprivileged user: {}", e).into())
+            }
+        }
+    }
+
     pub async fn reinstall_container(
         &self,
         internal_id: String,
