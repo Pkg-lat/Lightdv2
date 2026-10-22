@@ -12,6 +12,7 @@ use russh_keys::key::PublicKey;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use super::credentials::CredentialsManager;
 use super::protocol::SftpProtocol;
@@ -22,16 +23,23 @@ pub struct SftpSession {
     pub credentials_manager: Arc<CredentialsManager>,
     pub base_volumes_path: String,
     pub sftp_protocol: Option<Arc<SftpProtocol>>,
+    /// Bounds concurrent bcrypt work, which is CPU-expensive by design.
+    pub bcrypt: Arc<Semaphore>,
 }
 
 impl SftpSession {
-    pub fn new(credentials_manager: Arc<CredentialsManager>, base_volumes_path: String) -> Self {
+    pub fn new(
+        credentials_manager: Arc<CredentialsManager>,
+        base_volumes_path: String,
+        bcrypt: Arc<Semaphore>,
+    ) -> Self {
         Self {
             username: None,
             volume_path: None,
             credentials_manager,
             base_volumes_path,
             sftp_protocol: None,
+            bcrypt,
         }
     }
     
@@ -234,7 +242,10 @@ impl Handler for SftpSession {
         password: &str,
     ) -> Result<Auth, Self::Error> {
         tracing::info!("SFTP auth attempt for user: {}", user);
-        
+
+        // Throttle bcrypt: at most MAX_CONCURRENT_BCRYPT verifications at a time.
+        let _permit = self.bcrypt.acquire().await;
+
         // Verify credentials
         match self.credentials_manager.verify_credentials(user, password) {
             Ok(Some(creds)) => {

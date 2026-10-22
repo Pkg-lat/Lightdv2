@@ -247,6 +247,36 @@ async fn main_app(timer: Timer) {
     
     // Initialize WebSocket event hub
     let event_hub = Arc::new(websocket::EventHub::new());
+
+    // Reap event channels for containers that no longer exist.
+    //
+    // Each channel retains a 1024-event broadcast buffer plus a log buffer, and
+    // nothing released them when a container was deleted, so every container ever
+    // created leaked one for the process lifetime. This reconciles rather than
+    // hooking the delete path, so it also cleans up channels left by any other
+    // removal route.
+    {
+        let hub = event_hub.clone();
+        let manager = container_manager.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(120));
+            loop {
+                tick.tick().await;
+                match manager.list_containers().await {
+                    Ok(containers) => {
+                        let live: Vec<String> =
+                            containers.into_iter().map(|c| c.internal_id).collect();
+                        hub.cleanup_inactive_channels(&live);
+                    }
+                    Err(e) => {
+                        // Do not reap on a failed listing: without a reliable view of
+                        // what exists, cleanup would drop channels for live containers.
+                        tracing::warn!("Skipping WebSocket channel cleanup: {}", e);
+                    }
+                }
+            }
+        });
+    }
     
     // Initialize console streamer
     let console_streamer = Arc::new(websocket::ConsoleStreamer::new(
@@ -522,8 +552,15 @@ async fn main_app(timer: Timer) {
    // println!("Server running on http://{}", addr);
     //println!("WebSocket endpoint: ws://{}/ws/<container_id>", addr);
     
-    axum::serve(listener, app).await
-        .expect("Server failed");
+    // Serve with connect info so the auth middleware can attribute failed attempts
+    // to a peer address. Without this, ConnectInfo is never populated and the rate
+    // limit silently never triggers.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("Server failed");
 }
    
 

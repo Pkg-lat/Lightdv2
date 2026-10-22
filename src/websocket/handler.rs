@@ -21,6 +21,15 @@ use super::event_hub::{EventHub, InboundEvent, OutboundEvent, ContainerRuntimeSt
 use super::console::ConsoleStreamer;
 use super::stats::StatsCollector;
 use crate::auth::principal::{secret_eq, Principal};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use dashmap::DashMap;
+
+/// Maximum concurrent WebSocket connections per container.
+const MAX_WS_CONNECTIONS_PER_CONTAINER: usize = 8;
+
+/// Connections currently open per container. Decremented when a socket ends.
+static WS_CONNECTIONS: std::sync::LazyLock<DashMap<String, AtomicUsize>> =
+    std::sync::LazyLock::new(DashMap::new);
 use crate::auth::tokens::TokenManager;
 use crate::container::manager::ContainerManager;
 use crate::container::power::{PowerManager, PowerAction};
@@ -106,7 +115,29 @@ pub async fn ws_handler(
         }
     }
 
+    // Cap frame size: a single Text frame is buffered whole and then parsed, so an
+    // unbounded frame is a memory amplification vector. 64 KiB is far above any
+    // legitimate console command.
+    let ws = ws
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .max_write_buffer_size(64 * 1024);
+
     ws.on_upgrade(move |socket| handle_socket(socket, internal_id, state, principal))
+}
+
+/// Releases the per-container connection slot when a socket ends, on any path
+/// including an early return.
+struct ConnectionGuard {
+    internal_id: String,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = WS_CONNECTIONS.get(&self.internal_id) {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Handle the actual WebSocket connection
@@ -126,6 +157,28 @@ async fn handle_socket(socket: WebSocket, internal_id: String, state: WebSocketS
             tracing::error!("Error getting container: {}", e);
             return;
         }
+    };
+
+    // Enforce the per-container connection cap before spawning any work for this
+    // socket. Without it a client can open sockets without bound, each spawning a
+    // console stream and a stats collector.
+    let counter = WS_CONNECTIONS
+        .entry(internal_id.clone())
+        .or_insert_with(|| AtomicUsize::new(0));
+
+    if counter.fetch_add(1, Ordering::SeqCst) >= MAX_WS_CONNECTIONS_PER_CONTAINER {
+        counter.fetch_sub(1, Ordering::SeqCst);
+        tracing::warn!(
+            "WebSocket connection limit ({}) reached for container {}",
+            MAX_WS_CONNECTIONS_PER_CONTAINER,
+            internal_id
+        );
+        return;
+    }
+
+    // Decrement on every exit path below, including early returns.
+    let _conn_guard = ConnectionGuard {
+        internal_id: internal_id.clone(),
     };
     
     // Get or create event channel

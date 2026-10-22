@@ -4,7 +4,7 @@
 //! describing who the caller is so handlers can authorize against it.
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -15,6 +15,62 @@ use std::sync::Arc;
 use crate::auth::principal::{secret_eq, Principal};
 use crate::auth::tokens::TokenManager;
 use crate::config::config::Config;
+use std::net::IpAddr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Failed authentication attempts allowed per IP per window before rejecting.
+const AUTH_FAILURES_PER_WINDOW: u32 = 20;
+
+/// Length of the failure window.
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
+
+/// Failed attempts per client IP within the current window.
+///
+/// Only failures are counted, so a well-behaved client is never throttled. The
+/// intent is to make online guessing of a 32-hex master token impractical, which
+/// it otherwise is not: bcrypt cannot help here because the token is compared
+/// directly, so each request costs the attacker almost nothing.
+static AUTH_FAILURES: std::sync::LazyLock<Mutex<std::collections::HashMap<IpAddr, (u32, Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Record a failed attempt; returns true when the caller is over the limit.
+fn record_failure(ip: Option<IpAddr>) -> bool {
+    let Some(ip) = ip else {
+        // No peer address (e.g. a unix socket): cannot attribute, so do not throttle.
+        return false;
+    };
+
+    let mut failures = match AUTH_FAILURES.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let now = Instant::now();
+    let entry = failures.entry(ip).or_insert((0, now));
+
+    if now.duration_since(entry.1) > AUTH_WINDOW {
+        *entry = (0, now);
+    }
+
+    entry.0 = entry.0.saturating_add(1);
+
+    // Opportunistic sweep so the map cannot grow without bound under a spray
+    // across many source addresses.
+    if failures.len() > 10_000 {
+        failures.retain(|_, (_, started)| now.duration_since(*started) <= AUTH_WINDOW);
+    }
+
+    entry.0 > AUTH_FAILURES_PER_WINDOW
+}
+
+/// Clear the failure count after a successful authentication.
+fn clear_failures(ip: Option<IpAddr>) {
+    let Some(ip) = ip else { return };
+    if let Ok(mut failures) = AUTH_FAILURES.lock() {
+        failures.remove(&ip);
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -116,11 +172,30 @@ pub async fn auth_middleware(
         ).into_response();
     }
 
+    // Peer address, when the server is serving with connection info available.
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
     // Resolve identity. The failure response deliberately does not repeat the
     // expected token format or value.
     let principal = match resolve_principal(&headers, &auth_config) {
-        Some(principal) => principal,
+        Some(principal) => {
+            clear_failures(peer_ip);
+            principal
+        }
         None => {
+            if record_failure(peer_ip) {
+                tracing::warn!(?peer_ip, "Auth failure rate limit exceeded");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({
+                        "error": "Too many failed authentication attempts"
+                    }))
+                ).into_response();
+            }
+
             return (
                 StatusCode::UNAUTHORIZED,
                 axum::Json(json!({
