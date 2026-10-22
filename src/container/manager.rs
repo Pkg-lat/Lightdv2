@@ -1,20 +1,36 @@
 use super::state::{ContainerState, InstallState};
 use sled::Db;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub struct ContainerManager {
     db: Arc<Db>,
     states: Arc<RwLock<()>>, // Mutex for state updates
+    storage_root: PathBuf,
 }
 
 impl ContainerManager {
     pub fn new(db_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let db = sled::open(db_path)?;
+        // `db_path` is `<storage_root>/containers.db`, so the parent is the storage
+        // root. Mount sources are confined to this directory.
+        let storage_root = PathBuf::from(db_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
         Ok(Self {
             db: Arc::new(db),
             states: Arc::new(RwLock::new(())),
+            storage_root,
         })
+    }
+
+    /// Root directory holding all container and volume data.
+    ///
+    /// Used as the confinement boundary for API-supplied volume mount sources.
+    pub fn storage_root(&self) -> &Path {
+        &self.storage_root
     }
 
     pub async fn create_container(

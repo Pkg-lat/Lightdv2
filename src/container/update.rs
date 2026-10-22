@@ -200,6 +200,17 @@ impl ContainerUpdater {
         internal_id: String,
         volumes: HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Validate synchronously, before spawning.
+        //
+        // The job below used to do this inside the detached task, so every failure
+        // was swallowed into a log line while this method still returned Ok and the
+        // API answered 202 "accepted". A mount of /var/run/docker.sock therefore
+        // *looked* rejected to the caller while validation never actually blocked it.
+        crate::container::validation::validate_identifier("internal_id", &internal_id)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        crate::container::validation::validate_mounts(self.manager.storage_root(), &volumes)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
         let manager = self.manager.clone();
         let event_tx = self.event_tx.clone();
 
@@ -230,14 +241,12 @@ impl ContainerUpdater {
         internal_id: String,
         volumes: HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = event_tx.send(UpdateEvent::UpdateStarted { 
-            container_id: internal_id.clone() 
+        let _ = event_tx.send(UpdateEvent::UpdateStarted {
+            container_id: internal_id.clone()
         });
 
-        // Validate volumes
-        Self::validate_volumes(&volumes)?;
-
-        // Update database
+        // Mounts are validated by the caller before this job is spawned, so a
+        // rejection reaches the API client instead of dying here in the background.
         manager.update_volumes(&internal_id, volumes).await?;
 
         let _ = event_tx.send(UpdateEvent::VolumesUpdated { 
@@ -338,32 +347,6 @@ impl ContainerUpdater {
             
             if blkio_weight < 10 || blkio_weight > 1000 {
                 return Err("Block IO weight must be between 10 and 1000".into());
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validate volumes
-    fn validate_volumes(
-        volumes: &HashMap<String, String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        for (target, source) in volumes {
-            // Validate target path
-            if target.is_empty() || !target.starts_with('/') {
-                return Err(format!("Invalid target path: {}", target).into());
-            }
-
-            // Validate source path
-            if source.is_empty() {
-                return Err(format!("Invalid source path for target: {}", target).into());
-            }
-
-            // Check for dangerous paths
-            // Lightd is secure by default mate.
-            let dangerous_paths = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/proc", "/sys"];
-            if dangerous_paths.contains(&target.as_str()) {
-                return Err(format!("Cannot mount to system path: {}", target).into());
             }
         }
 

@@ -14,6 +14,7 @@ use crate::container::power::{PowerManager, PowerAction};
 use crate::container::network::NetworkRebinder;
 use crate::container::state::{ContainerState, InstallState, PortBinding};
 use crate::container::update::{ContainerUpdater, ResourceLimits};
+use crate::container::validation::{validate_identifier, validate_mounts};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -118,6 +119,50 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Path parameter that is validated before any handler sees it.
+///
+/// `internal_id` is joined onto the host filesystem as
+/// `containers_path.join(internal_id)` and used as a sled key, so an unvalidated
+/// value is a path traversal. Using this extractor in place of `Path<String>`
+/// means the check runs for every route automatically — and a route added later
+/// cannot forget it, which a per-handler call could.
+struct ValidatedId(String);
+
+// axum 0.7 declares FromRequestParts with #[async_trait], so the impl must carry
+// the same attribute to match the desugared method signature.
+#[async_trait::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for ValidatedId
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Missing container id".to_string(),
+                    }),
+                )
+            })?;
+
+        validate_identifier("container id", &id).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+
+        Ok(ValidatedId(id))
+    }
+}
+
 #[derive(Serialize)]
 struct SuccessResponse {
     message: String,
@@ -165,6 +210,17 @@ async fn create_container(
     State(state): State<ContainerAppState>,
     Json(payload): Json<CreateContainerRequest>,
 ) -> Response {
+    // Both identifiers are joined onto host paths, so validate before anything is
+    // created or written. A 400 here beats a container that escapes the storage root.
+    for (kind, value) in [
+        ("internal_id", &payload.internal_id),
+        ("volume_id", &payload.volume_id),
+    ] {
+        if let Err(e) = validate_identifier(kind, value) {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
+        }
+    }
+
     // Create container state
     match state
         .manager
@@ -288,7 +344,7 @@ async fn list_containers(
 
 async fn get_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     match state.manager.get_container(&id).await {
         Ok(Some(mut container)) => {
@@ -390,7 +446,7 @@ async fn hydrate_live_limits(state: &ContainerAppState, containers: &mut [Contai
 
 async fn delete_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     // Get container to check for ports before deletion
     if let Ok(Some(container)) = state.manager.get_container(&id).await {
@@ -429,7 +485,7 @@ async fn delete_container(
 #[axum::debug_handler]
 async fn reinstall_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<ReinstallContainerRequest>,
 ) -> Response {
     // Check if container exists
@@ -485,7 +541,7 @@ async fn reinstall_container(
 #[axum::debug_handler]
 async fn repair_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<RepairContainerRequest>,
 ) -> Response {
     match state.lifecycle.repair_if_corrupted(id.clone(), payload.image).await {
@@ -514,7 +570,7 @@ async fn repair_container(
 /// Validate container state and check for corruption
 async fn validate_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     // First validate DB state
     let (is_valid, issue) = match state.manager.validate_container(&id).await {
@@ -546,7 +602,7 @@ async fn validate_container(
 /// Get detailed container status
 async fn get_container_status(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     match state.manager.get_container(&id).await {
         Ok(Some(container)) => {
@@ -591,7 +647,7 @@ async fn get_container_status(
 /// Update container startup command
 async fn update_startup_command(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateStartupRequest>,
 ) -> Response {
     let startup_command = payload.startup_command;
@@ -628,7 +684,7 @@ async fn update_startup_command(
 /// Update container start pattern
 async fn update_start_pattern(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateStartPatternRequest>,
 ) -> Response {
     let start_pattern = payload.start_pattern;
@@ -667,7 +723,7 @@ async fn update_start_pattern(
 #[axum::debug_handler]
 async fn start_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     match state.power.execute_action(id.clone(), PowerAction::Start).await {
         Ok(_) => (
@@ -690,7 +746,7 @@ async fn start_container(
 #[axum::debug_handler]
 async fn kill_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     match state.power.execute_action(id.clone(), PowerAction::Kill).await {
         Ok(_) => (
@@ -713,7 +769,7 @@ async fn kill_container(
 #[axum::debug_handler]
 async fn restart_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     match state.power.execute_action(id.clone(), PowerAction::Restart).await {
         Ok(_) => (
@@ -745,7 +801,7 @@ struct RebindNetworkRequest {
 #[axum::debug_handler]
 async fn rebind_network(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<RebindNetworkRequest>,
 ) -> Response {
     match state.network.rebind_ports(id.clone(), payload.ports, payload.image).await {
@@ -808,7 +864,7 @@ struct ResourcesResponse {
 /// Update container resource limits (live, no restart)
 async fn update_resources(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateResourcesRequest>,
 ) -> Response {
     // Create updater
@@ -876,7 +932,7 @@ async fn update_resources(
 /// Get current resource limits
 async fn get_resources(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
     tracing::debug!(container_id = %id, "Resource limits lookup requested");
 
@@ -939,7 +995,7 @@ async fn get_resources(
 /// Update container volumes (requires restart)
 async fn update_volumes(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateVolumesRequest>,
 ) -> Response {
     let volumes = payload.volumes;

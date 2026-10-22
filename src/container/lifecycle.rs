@@ -268,6 +268,12 @@ impl LifecycleManager {
             .await?
             .ok_or_else(|| format!("Container state not found for internal_id: {}", internal_id))?;
 
+        // Defence in depth. These are validated at the API boundary, but rows written
+        // before that check existed are still in sled, and this is the last point
+        // before the values become host paths and a Docker bind mount.
+        crate::container::validation::validate_identifier("volume_id", &state.volume_id)?;
+        crate::container::validation::validate_identifier("internal_id", &internal_id)?;
+
         // Create absolute paths for volumes
         let volume_path = base_path.join("volumes").join(&state.volume_id);
         let container_data_path = base_path.join("containers").join(&internal_id);

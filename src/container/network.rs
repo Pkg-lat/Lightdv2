@@ -163,6 +163,10 @@ impl NetworkRebinder {
 
         let _ = event_tx.send(NetworkEvent::CreatingNewContainer(internal_id.clone()));
 
+        // Defence in depth: these become host paths and bind mounts below.
+        crate::container::validation::validate_identifier("volume_id", &state.volume_id)?;
+        crate::container::validation::validate_identifier("internal_id", &internal_id)?;
+
         // Use config paths
         let volume_path = format!("{}/{}", config.storage.volumes_path, state.volume_id);
         let container_data_path = format!("{}/{}", config.storage.containers_path, internal_id);
