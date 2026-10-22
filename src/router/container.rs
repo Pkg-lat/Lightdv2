@@ -1,5 +1,7 @@
 use axum::{
-    extract::{Path, State},
+    // FromRequestParts must be in scope: the ValidatedId impl below calls
+    // Path::<String>::from_request_parts, which is a trait associated function.
+    extract::{FromRequestParts, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post, delete},
@@ -14,7 +16,7 @@ use crate::container::power::{PowerManager, PowerAction};
 use crate::container::network::NetworkRebinder;
 use crate::container::state::{ContainerState, InstallState, PortBinding};
 use crate::container::update::{ContainerUpdater, ResourceLimits};
-use crate::container::validation::{validate_identifier, validate_mounts};
+use crate::container::validation::validate_identifier;
 use crate::auth::principal::Principal;
 use axum::Extension;
 use std::collections::HashMap;

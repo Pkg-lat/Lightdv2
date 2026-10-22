@@ -21,15 +21,49 @@ use super::event_hub::{EventHub, InboundEvent, OutboundEvent, ContainerRuntimeSt
 use super::console::ConsoleStreamer;
 use super::stats::StatsCollector;
 use crate::auth::principal::{secret_eq, Principal};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use dashmap::DashMap;
 
 /// Maximum concurrent WebSocket connections per container.
 const MAX_WS_CONNECTIONS_PER_CONTAINER: usize = 8;
 
-/// Connections currently open per container. Decremented when a socket ends.
-static WS_CONNECTIONS: std::sync::LazyLock<DashMap<String, AtomicUsize>> =
-    std::sync::LazyLock::new(DashMap::new);
+/// Connections currently open per container.
+///
+/// A plain Mutex-protected map rather than a DashMap: DashMap's `entry` returns a
+/// guard that holds the shard lock until it is dropped, which would be held across
+/// the rest of the connection setup and could deadlock other sockets on the same
+/// shard.
+static WS_CONNECTIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Try to claim a connection slot for `internal_id`.
+fn try_acquire_ws_slot(internal_id: &str) -> bool {
+    let mut counts = match WS_CONNECTIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let count = counts.entry(internal_id.to_string()).or_insert(0);
+    if *count >= MAX_WS_CONNECTIONS_PER_CONTAINER {
+        return false;
+    }
+
+    *count += 1;
+    true
+}
+
+/// Release a connection slot for `internal_id`.
+fn release_ws_slot(internal_id: &str) {
+    let mut counts = match WS_CONNECTIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if let Some(count) = counts.get_mut(internal_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(internal_id);
+        }
+    }
+}
 use crate::auth::tokens::TokenManager;
 use crate::container::manager::ContainerManager;
 use crate::container::power::{PowerManager, PowerAction};
@@ -134,9 +168,7 @@ struct ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if let Some(counter) = WS_CONNECTIONS.get(&self.internal_id) {
-            counter.fetch_sub(1, Ordering::SeqCst);
-        }
+        release_ws_slot(&self.internal_id);
     }
 }
 
@@ -162,12 +194,7 @@ async fn handle_socket(socket: WebSocket, internal_id: String, state: WebSocketS
     // Enforce the per-container connection cap before spawning any work for this
     // socket. Without it a client can open sockets without bound, each spawning a
     // console stream and a stats collector.
-    let counter = WS_CONNECTIONS
-        .entry(internal_id.clone())
-        .or_insert_with(|| AtomicUsize::new(0));
-
-    if counter.fetch_add(1, Ordering::SeqCst) >= MAX_WS_CONNECTIONS_PER_CONTAINER {
-        counter.fetch_sub(1, Ordering::SeqCst);
+    if !try_acquire_ws_slot(&internal_id) {
         tracing::warn!(
             "WebSocket connection limit ({}) reached for container {}",
             MAX_WS_CONNECTIONS_PER_CONTAINER,

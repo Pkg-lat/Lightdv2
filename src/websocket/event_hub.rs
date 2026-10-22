@@ -192,20 +192,9 @@ impl EventHub {
     /// Deliberately does NOT remove the channel: several clients can be connected to
     /// one container, and tearing the channel down when one disconnects would break
     /// the others. Channel teardown belongs to container deletion — see
-    /// `remove_channel`.
+    /// `cleanup_inactive_channels`.
     pub async fn mark_container_inactive(&self, internal_id: &str) {
         self.active_containers.remove(internal_id);
-    }
-
-    /// Drop a container's event channel entirely, releasing its buffers.
-    ///
-    /// Call when the container is deleted. Nothing called this before, so every
-    /// container ever created left a channel holding a 1024-event broadcast buffer
-    /// and a log buffer in memory for the lifetime of the process.
-    pub fn remove_channel(&self, internal_id: &str) {
-        self.active_containers.remove(internal_id);
-        self.channels.remove(internal_id);
-        tracing::info!("Released WebSocket channel for container: {}", internal_id);
     }
 
     /// Check if container is active
