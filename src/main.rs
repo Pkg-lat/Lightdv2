@@ -414,8 +414,6 @@ async fn main_app(timer: Timer) {
     
     // Setup routers
     let public_routes = router::public::public_router();
-    let auth_routes = router::auth::auth_router(token_manager.clone());
-    let remote_routes = router::remote::remote_router();
     let firewall_routes = router::firewall::firewall_router(firewall_manager);
     let billing_routes = router::billing::billing_router(billing_tracker);
     
@@ -431,7 +429,17 @@ async fn main_app(timer: Timer) {
     
     // Create auth config for middleware
     let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config));
-    
+
+    // Tokens are minted only by an authenticated caller. Previously this router was
+    // mounted bare, so any unauthenticated client could mint a token and then satisfy
+    // the WebSocket token check — bypassing the API gate entirely.
+    let auth_routes = router::auth::auth_router(token_manager.clone())
+        .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+    // Config read/reload is administrative; it was mounted bare and leaked the
+    // master bearer token in its response.
+    let remote_routes = router::remote::remote_router()
+        .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+
     // Protected routes with auth middleware
     let filesystem_routes = router::filesystem::volume_router(volume_handler)
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
@@ -452,19 +460,27 @@ async fn main_app(timer: Timer) {
         .with_state(ws_state);
     
     // Build CORS layer based on allowed origins from config
-    let cors_layer = if config.authorization.allowed_origins.contains(&"*".to_string()) {
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
-    } else {
+    // Wildcard origins combined with credentials are not emitted: an invalid origin
+    // string in config is skipped with a warning rather than panicking the daemon.
+    let cors_layer = {
         let mut cors = CorsLayer::new();
+        let mut wildcard = false;
         for origin in &config.authorization.allowed_origins {
             if origin == "*" {
-                cors = cors.allow_origin(Any);
+                wildcard = true;
             } else {
-                cors = cors.allow_origin(origin.parse::<HeaderValue>().unwrap());
+                match origin.parse::<HeaderValue>() {
+                    Ok(value) => cors = cors.allow_origin(value),
+                    Err(_) => tracing::warn!("Ignoring invalid CORS origin in config: {:?}", origin),
+                }
             }
+        }
+        if wildcard {
+            tracing::warn!(
+                "allowed_origins contains \"*\": any website can call this API from a browser. \
+                 Restrict it to your dashboard origin."
+            );
+            cors = cors.allow_origin(Any);
         }
         cors.allow_methods(Any).allow_headers(Any)
     };

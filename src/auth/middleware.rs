@@ -8,7 +8,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use serde_json::json
+use serde_json::json;
 use std::sync::Arc;
 
 use crate::config::config::Config;
