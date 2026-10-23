@@ -6,7 +6,7 @@
  */
 
 const BASE_URL = 'http://localhost:8070';
-const TOKEN = 'lightd_ad2f7fc49ed640429c450e14ed07c8d5';
+const TOKEN = process.env.LIGHTD_API_TOKEN || 'lightd_your_token_here';
 
 const headers = {
     'Authorization': `Bearer ${TOKEN}`,

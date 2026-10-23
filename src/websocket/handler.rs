@@ -20,9 +20,54 @@ use tracing::{debug, error, info, warn};
 use super::event_hub::{EventHub, InboundEvent, OutboundEvent, ContainerRuntimeState};
 use super::console::ConsoleStreamer;
 use super::stats::StatsCollector;
+use crate::auth::principal::{secret_eq, Principal};
+
+/// Maximum concurrent WebSocket connections per container.
+const MAX_WS_CONNECTIONS_PER_CONTAINER: usize = 8;
+
+/// Connections currently open per container.
+///
+/// A plain Mutex-protected map rather than a DashMap: DashMap's `entry` returns a
+/// guard that holds the shard lock until it is dropped, which would be held across
+/// the rest of the connection setup and could deadlock other sockets on the same
+/// shard.
+static WS_CONNECTIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Try to claim a connection slot for `internal_id`.
+fn try_acquire_ws_slot(internal_id: &str) -> bool {
+    let mut counts = match WS_CONNECTIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let count = counts.entry(internal_id.to_string()).or_insert(0);
+    if *count >= MAX_WS_CONNECTIONS_PER_CONTAINER {
+        return false;
+    }
+
+    *count += 1;
+    true
+}
+
+/// Release a connection slot for `internal_id`.
+fn release_ws_slot(internal_id: &str) {
+    let mut counts = match WS_CONNECTIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if let Some(count) = counts.get_mut(internal_id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(internal_id);
+        }
+    }
+}
 use crate::auth::tokens::TokenManager;
 use crate::container::manager::ContainerManager;
 use crate::container::power::{PowerManager, PowerAction};
+use crate::container::validation::validate_identifier;
 
 #[derive(Deserialize)]
 pub struct WebSocketQuery {
@@ -38,6 +83,9 @@ pub struct WebSocketState {
     pub console_streamer: Arc<ConsoleStreamer>,
     pub stats_collector: Arc<StatsCollector>,
     pub token_manager: Arc<TokenManager>,
+    /// Master token from config, accepted for the upgrade. Without this the panel's
+    /// own admin credential could not open a console.
+    pub api_token: String,
 }
 
 /// Handle WebSocket upgrade request
@@ -48,45 +96,116 @@ pub async fn ws_handler(
     State(state): State<WebSocketState>,
 ) -> Response {
     tracing::info!("WebSocket upgrade request for container: {}", internal_id);
-    
-    // Validate token
-    match state.token_manager.validate_token(&query.token, true) {
-        Ok(true) => {
-            tracing::info!("Token validated for WebSocket connection: {}", internal_id);
-            ws.on_upgrade(move |socket| handle_socket(socket, internal_id, state, query.token))
+
+    // Validate the path parameter before it is used as a sled key.
+    if let Err(e) = validate_identifier("container id", &internal_id) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+
+    // Resolve the token to a principal. The master token is accepted directly (in
+    // constant time); otherwise the token must be a minted, unexpired token, whose
+    // owner scopes which containers are reachable.
+    let principal = {
+        let master = std::env::var("LIGHTD_API_TOKEN").unwrap_or_else(|_| state.api_token.clone());
+        if !master.is_empty() && secret_eq(&query.token, &master) {
+            Some(Principal::admin())
+        } else {
+            match state.token_manager.validate_token(&query.token, false) {
+                Ok(Some(data)) if data.is_admin() => Some(Principal::admin()),
+                Ok(Some(data)) => Some(Principal::tenant(data.owner)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!("WebSocket token validation error: {}", e);
+                    None
+                }
+            }
         }
-        Ok(false) => {
-            tracing::warn!("Invalid or expired token for WebSocket: {}", internal_id);
-            (
+    };
+
+    let principal = match principal {
+        Some(principal) => principal,
+        None => {
+            tracing::warn!("WebSocket upgrade rejected: invalid or expired token");
+            return (
                 StatusCode::UNAUTHORIZED,
                 "Invalid or expired token"
-            ).into_response()
+            ).into_response();
+        }
+    };
+
+    // Authorize against the container *before* upgrading. Previously the handler
+    // checked only that the container existed, so any valid token could read the
+    // console of, write stdin to, and power-cycle every container on the host.
+    match state.manager.get_container(&internal_id).await {
+        Ok(Some(container)) if principal.can_access(&container) => {}
+        Ok(_) => {
+            // 404 rather than 403: do not confirm that another tenant's id exists.
+            tracing::warn!("WebSocket upgrade rejected: container not accessible");
+            return (StatusCode::NOT_FOUND, "Container not found").into_response();
         }
         Err(e) => {
-            tracing::error!("Token validation error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Token validation failed"
-            ).into_response()
+            tracing::error!("Error loading container for upgrade: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Lookup failed").into_response();
         }
+    }
+
+    // Cap frame size: a single Text frame is buffered whole and then parsed, so an
+    // unbounded frame is a memory amplification vector. 64 KiB is far above any
+    // legitimate console command.
+    let ws = ws
+        .max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .max_write_buffer_size(64 * 1024);
+
+    ws.on_upgrade(move |socket| handle_socket(socket, internal_id, state, principal))
+}
+
+/// Releases the per-container connection slot when a socket ends, on any path
+/// including an early return.
+struct ConnectionGuard {
+    internal_id: String,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        release_ws_slot(&self.internal_id);
     }
 }
 
 /// Handle the actual WebSocket connection
-async fn handle_socket(socket: WebSocket, internal_id: String, state: WebSocketState, token: String) {
+async fn handle_socket(socket: WebSocket, internal_id: String, state: WebSocketState, principal: Principal) {
     tracing::info!("WebSocket connected for container: {}", internal_id);
-    
-    // Verify container exists
+
+    // Verify the container still exists and the principal still owns it. The
+    // upgrade already checked this, but the connection lives for a long time and a
+    // container can be reassigned in between.
     let container = match state.manager.get_container(&internal_id).await {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            tracing::error!("Container not found: {}", internal_id);
+        Ok(Some(c)) if principal.can_access(&c) => c,
+        Ok(_) => {
+            tracing::warn!("WebSocket closed: container not accessible");
             return;
         }
         Err(e) => {
             tracing::error!("Error getting container: {}", e);
             return;
         }
+    };
+
+    // Enforce the per-container connection cap before spawning any work for this
+    // socket. Without it a client can open sockets without bound, each spawning a
+    // console stream and a stats collector.
+    if !try_acquire_ws_slot(&internal_id) {
+        tracing::warn!(
+            "WebSocket connection limit ({}) reached for container {}",
+            MAX_WS_CONNECTIONS_PER_CONTAINER,
+            internal_id
+        );
+        return;
+    }
+
+    // Decrement on every exit path below, including early returns.
+    let _conn_guard = ConnectionGuard {
+        internal_id: internal_id.clone(),
     };
     
     // Get or create event channel
@@ -155,22 +274,30 @@ async fn handle_socket(socket: WebSocket, internal_id: String, state: WebSocketS
         }
     });
     
-    // Spawn task to handle outgoing messages
-    let token_manager_send = state.token_manager.clone();
-    let token_clone = token.clone();
+    // Spawn task to handle outgoing messages.
+    //
+    // The per-event re-validation was removed: it re-checked the *same* immutable
+    // token on every event, so it could never observe an expiry it did not already
+    // know about, and for a single-use token it always failed and tore the
+    // connection down on the first event. Authorization is decided once, at upgrade,
+    // and re-checked per connection rather than per event.
+    let manager_send = state.manager.clone();
+    let internal_id_send = internal_id.clone();
+    let principal_send = principal.clone();
     let send_task = tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
-            // Check if token is still valid
-            match token_manager_send.validate_token(&token_clone, false) {
-                Ok(false) | Err(_) => {
-                    tracing::warn!("Token expired during WebSocket connection, closing");
-                    break;
-                }
-                Ok(true) => {
-                    // Token still valid, continue
+            // Cheap per-event ownership re-check: a container can be deleted or
+            // reassigned while the socket is open.
+            if !principal_send.is_admin() {
+                match manager_send.get_container(&internal_id_send).await {
+                    Ok(Some(c)) if principal_send.can_access(&c) => {}
+                    _ => {
+                        tracing::warn!("Container no longer accessible, closing WebSocket");
+                        break;
+                    }
                 }
             }
-            
+
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,
                 Err(e) => {

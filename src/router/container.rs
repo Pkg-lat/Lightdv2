@@ -1,5 +1,7 @@
 use axum::{
-    extract::{Path, State},
+    // FromRequestParts must be in scope: the ValidatedId impl below calls
+    // Path::<String>::from_request_parts, which is a trait associated function.
+    extract::{FromRequestParts, Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post, delete},
@@ -14,6 +16,9 @@ use crate::container::power::{PowerManager, PowerAction};
 use crate::container::network::NetworkRebinder;
 use crate::container::state::{ContainerState, InstallState, PortBinding};
 use crate::container::update::{ContainerUpdater, ResourceLimits};
+use crate::container::validation::validate_identifier;
+use crate::auth::principal::Principal;
+use axum::Extension;
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -118,9 +123,90 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Path parameter that is validated before any handler sees it.
+///
+/// `internal_id` is joined onto the host filesystem as
+/// `containers_path.join(internal_id)` and used as a sled key, so an unvalidated
+/// value is a path traversal. Using this extractor in place of `Path<String>`
+/// means the check runs for every route automatically — and a route added later
+/// cannot forget it, which a per-handler call could.
+struct ValidatedId(String);
+
+// axum 0.7 declares FromRequestParts with #[async_trait], so the impl must carry
+// the same attribute to match the desugared method signature.
+#[async_trait::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for ValidatedId
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<ErrorResponse>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "Missing container id".to_string(),
+                    }),
+                )
+            })?;
+
+        validate_identifier("container id", &id).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+
+        Ok(ValidatedId(id))
+    }
+}
+
 #[derive(Serialize)]
 struct SuccessResponse {
     message: String,
+}
+
+/// Reject a request unless the caller may act on `id`.
+///
+/// Returns 404 rather than 403: telling a tenant "this exists but is not yours"
+/// still confirms the container id exists, which is information about other
+/// tenants. Admins short-circuit, so the common path costs one comparison.
+async fn ensure_owns(
+    principal: &Principal,
+    manager: &ContainerManager,
+    id: &str,
+) -> Result<(), Response> {
+    if principal.is_admin() {
+        return Ok(());
+    }
+
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Container not found".to_string(),
+            }),
+        )
+            .into_response()
+    };
+
+    match manager.get_container(id).await {
+        Ok(Some(container)) if principal.can_access(&container) => Ok(()),
+        Ok(_) => Err(not_found()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response()),
+    }
 }
 
 pub fn container_router(
@@ -163,15 +249,35 @@ pub fn container_router(
 #[axum::debug_handler]
 async fn create_container(
     State(state): State<ContainerAppState>,
+    Extension(principal): Extension<Principal>,
     Json(payload): Json<CreateContainerRequest>,
 ) -> Response {
+    // Both identifiers are joined onto host paths, so validate before anything is
+    // created or written. A 400 here beats a container that escapes the storage root.
+    for (kind, value) in [
+        ("internal_id", &payload.internal_id),
+        ("volume_id", &payload.volume_id),
+    ] {
+        if let Err(e) = validate_identifier(kind, value) {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
+        }
+    }
+
     // Create container state
+    // The owner is taken from the authenticated principal, never from the request
+    // body — otherwise a caller could name a container into another tenant's scope.
+    let owner = principal
+        .owner_id()
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::auth::tokens::ADMIN_OWNER.to_string());
+
     match state
         .manager
         .create_container(
             payload.internal_id.clone(),
             payload.volume_id,
             payload.startup_command,
+            owner,
         )
         .await
     {
@@ -189,22 +295,17 @@ async fn create_container(
                 let mut assigned_ports = Vec::new();
                 
                 for request in port_requests {
-                    // Get random available port from pool
-                    match state.pool.get_random_available().await {
+                    // Claim a port atomically. Reserving and marking separately let
+                    // two concurrent creations be handed the same host port.
+                    match state.pool.reserve_port_for(&payload.internal_id).await {
                         Ok(Some(network_port)) => {
-                            // Mark port as in use
-                            if let Err(e) = state.pool.mark_in_use(&network_port.id, true).await {
-                                tracing::error!("Failed to mark port {} as in use: {}", network_port.id, e);
-                                continue;
-                            }
-                            
                             // Create port binding
                             let binding = PortBinding {
                                 container_port: request.container_port,
                                 host_port: network_port.port,
                                 protocol: request.protocol,
                             };
-                            
+
                             assigned_ports.push(binding);
                             tracing::info!("Assigned port {} -> {} for container {}", 
                                 request.container_port, network_port.port, payload.internal_id);
@@ -271,9 +372,15 @@ async fn create_container(
 
 async fn list_containers(
     State(state): State<ContainerAppState>,
+    Extension(principal): Extension<Principal>,
 ) -> Response {
     match state.manager.list_containers().await {
         Ok(mut containers) => {
+            // Scope the listing to the caller. This route previously returned every
+            // container on the host, including other tenants'.
+            if !principal.is_admin() {
+                containers.retain(|c| principal.can_access(c));
+            }
             hydrate_live_limits(&state, &mut containers).await;
             (StatusCode::OK, Json(containers)).into_response()
         }
@@ -288,8 +395,15 @@ async fn list_containers(
 
 async fn get_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     match state.manager.get_container(&id).await {
         Ok(Some(mut container)) => {
             hydrate_single_live_limits(&state, &mut container).await;
@@ -390,28 +504,31 @@ async fn hydrate_live_limits(state: &ContainerAppState, containers: &mut [Contai
 
 async fn delete_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
-    // Get container to check for ports before deletion
-    if let Ok(Some(container)) = state.manager.get_container(&id).await {
-        // Return ports to pool
-        for port_binding in &container.ports {
-            // Find the port in the pool by host_port and mark as available
-            if let Ok(all_ports) = state.pool.get_all_ports().await {
-                for network_port in all_ports {
-                    if network_port.port == port_binding.host_port && network_port.in_use {
-                        if let Err(e) = state.pool.mark_in_use(&network_port.id, false).await {
-                            tracing::error!("Failed to return port {} to pool: {}", network_port.port, e);
-                        } else {
-                            tracing::info!("Returned port {} to pool", network_port.port);
-                        }
-                        break;
-                    }
-                }
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
+    // Return this container's ports to the pool.
+    //
+    // Previously this scanned every pool entry and released the first whose port
+    // number matched a binding, so when two containers shared a port it released
+    // whichever it found first — possibly the other container's, or its own while
+    // leaving the other claimed. Ports are now released by the container that
+    // holds them.
+    match state.pool.return_ports_for(&id).await {
+        Ok(released) => {
+            for port in released {
+                tracing::info!("Returned port {} to pool on container delete", port.port);
             }
         }
+        Err(e) => tracing::error!("Failed to return ports for {}: {}", id, e),
     }
-    
+
     match state.manager.delete_container(&id).await {
         Ok(container) => (StatusCode::OK, Json(container)).into_response(),
         Err(e) => (
@@ -429,9 +546,16 @@ async fn delete_container(
 #[axum::debug_handler]
 async fn reinstall_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<ReinstallContainerRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     // Check if container exists
     match state.manager.get_container(&id).await {
         Ok(Some(container)) => {
@@ -485,9 +609,16 @@ async fn reinstall_container(
 #[axum::debug_handler]
 async fn repair_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<RepairContainerRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     match state.lifecycle.repair_if_corrupted(id.clone(), payload.image).await {
         Ok(repaired) => {
             let message = if repaired {
@@ -514,8 +645,15 @@ async fn repair_container(
 /// Validate container state and check for corruption
 async fn validate_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     // First validate DB state
     let (is_valid, issue) = match state.manager.validate_container(&id).await {
         Ok(result) => result,
@@ -546,8 +684,15 @@ async fn validate_container(
 /// Get detailed container status
 async fn get_container_status(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     match state.manager.get_container(&id).await {
         Ok(Some(container)) => {
             // Validate for corruption
@@ -591,9 +736,16 @@ async fn get_container_status(
 /// Update container startup command
 async fn update_startup_command(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateStartupRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     let startup_command = payload.startup_command;
     tracing::info!(
         container_id = %id,
@@ -628,9 +780,16 @@ async fn update_startup_command(
 /// Update container start pattern
 async fn update_start_pattern(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateStartPatternRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     let start_pattern = payload.start_pattern;
     tracing::info!(
         container_id = %id,
@@ -667,8 +826,15 @@ async fn update_start_pattern(
 #[axum::debug_handler]
 async fn start_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     match state.power.execute_action(id.clone(), PowerAction::Start).await {
         Ok(_) => (
             StatusCode::OK,
@@ -690,8 +856,15 @@ async fn start_container(
 #[axum::debug_handler]
 async fn kill_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     match state.power.execute_action(id.clone(), PowerAction::Kill).await {
         Ok(_) => (
             StatusCode::OK,
@@ -713,8 +886,15 @@ async fn kill_container(
 #[axum::debug_handler]
 async fn restart_container(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     match state.power.execute_action(id.clone(), PowerAction::Restart).await {
         Ok(_) => (
             StatusCode::OK,
@@ -745,9 +925,30 @@ struct RebindNetworkRequest {
 #[axum::debug_handler]
 async fn rebind_network(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<RebindNetworkRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
+    // Rebind takes a caller-supplied host port list which is not validated against
+    // the pool (host ports can be arbitrary, and the requested ports are not
+    // checked for availability or ownership), so a tenant could bind host :22 or
+    // steal another container's port. Restricted to admin until port requests are
+    // resolved through the pool.
+    if !principal.is_admin() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Network rebinding requires an admin token".to_string(),
+            }),
+        ).into_response();
+    }
+
     match state.network.rebind_ports(id.clone(), payload.ports, payload.image).await {
         Ok(_) => (
             StatusCode::OK,
@@ -808,9 +1009,16 @@ struct ResourcesResponse {
 /// Update container resource limits (live, no restart)
 async fn update_resources(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateResourcesRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     // Create updater
     let updater = match ContainerUpdater::new(state.manager.clone()) {
         Ok((updater, _rx)) => updater,
@@ -876,8 +1084,15 @@ async fn update_resources(
 /// Get current resource limits
 async fn get_resources(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     tracing::debug!(container_id = %id, "Resource limits lookup requested");
 
     let updater = match ContainerUpdater::new(state.manager.clone()) {
@@ -939,9 +1154,16 @@ async fn get_resources(
 /// Update container volumes (requires restart)
 async fn update_volumes(
     State(state): State<ContainerAppState>,
-    Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
+    ValidatedId(id): ValidatedId,
     Json(payload): Json<UpdateVolumesRequest>,
 ) -> Response {
+    // Ownership gate: 404 rather than 403 so a tenant cannot probe
+    // which container ids exist on the host.
+    if let Err(response) = ensure_owns(&principal, &state.manager, &id).await {
+        return response;
+    }
+
     let volumes = payload.volumes;
     let volume_targets: Vec<&str> = volumes.keys().map(String::as_str).collect();
     tracing::info!(

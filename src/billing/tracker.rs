@@ -108,12 +108,16 @@ impl BillingTracker {
     async fn collect_metrics(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // List all containers
         let containers = self.docker.list_containers::<String>(None).await?;
-        
+
+        // Track which container ids still exist so stale history can be pruned below.
+        let mut live_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for container in containers {
             if let Some(id) = container.id {
                 // Only monitor lightd containers
                 if let Some(names) = container.names {
                     if names.iter().any(|n| n.contains("lightd-")) {
+                        live_keys.insert(id.clone());
                         if let Err(e) = self.collect_container_metrics(&id).await {
                             tracing::warn!("Failed to collect metrics for {}: {}", id, e);
                         }
@@ -122,12 +126,32 @@ impl BillingTracker {
             }
         }
         
+        // Prune entries for containers that no longer exist.
+        //
+        // Retention inside collect_container_metrics only runs for containers that
+        // still exist, so a container created and then deleted left its key and its
+        // retained samples in the map forever — one stale entry per historical
+        // container, growing without bound on a long-running daemon.
+        self.prune_missing_containers(&live_keys).await;
+
         // Send billing updates to remote if configured
         if let Some(ref remote_sync) = self.remote_sync {
             self.sync_billing_to_remote(remote_sync).await;
         }
         
         Ok(())
+    }
+
+    /// Drop usage history for containers that are no longer running.
+    async fn prune_missing_containers(&self, live_keys: &std::collections::HashSet<String>) {
+        let mut data = self.usage_data.write().await;
+        let before = data.len();
+        data.retain(|key, _| live_keys.contains(key));
+        let removed = before - data.len();
+
+        if removed > 0 {
+            tracing::debug!("Pruned billing history for {} removed container(s)", removed);
+        }
     }
     
     /// Sync billing data to remote server
@@ -143,23 +167,25 @@ impl BillingTracker {
             }
         };
         
+        // Listed once, not per tracked container. This was inside the loop, making
+        // the sync an O(tracked x containers) sled scan every interval.
+        let containers = match manager.list_containers().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to list containers for billing sync: {}", e);
+                return;
+            }
+        };
+
+        // Index by Docker id for O(1) lookup.
+        let by_docker_id: std::collections::HashMap<&str, &str> = containers
+            .iter()
+            .filter_map(|c| c.container_id.as_deref().map(|did| (did, c.internal_id.as_str())))
+            .collect();
+
         for docker_container_id in tracked {
-            // Get all containers and find matching internal_id
-            let containers = match manager.list_containers().await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to list containers for billing sync: {}", e);
-                    continue;
-                }
-            };
-            
-            // Find container with matching Docker ID
-            let internal_id = containers.iter()
-                .find(|c| c.container_id.as_ref() == Some(&docker_container_id))
-                .map(|c| c.internal_id.clone());
-            
-            let internal_id = match internal_id {
-                Some(id) => id,
+            let internal_id = match by_docker_id.get(docker_container_id.as_str()) {
+                Some(id) => (*id).to_string(),
                 None => {
                     tracing::debug!("No internal_id found for Docker container: {}", docker_container_id);
                     continue;

@@ -12,6 +12,13 @@ use tokio::sync::Mutex;
 
 use crate::filesystem::security;
 
+/// Maximum concurrent open handles per SFTP session.
+///
+/// Handles are held in an unbounded HashMap, and OPENDIR retains every directory
+/// entry of the opened directory, so a client could pin arbitrary memory by
+/// opening handles without closing them.
+const MAX_OPEN_HANDLES: usize = 256;
+
 /// SFTP file handle
 pub struct SftpHandle {
     pub path: PathBuf,
@@ -63,8 +70,15 @@ impl SftpProtocol {
         std::borrow::Cow::Borrowed(path)
     }
     
-    /// Generate next handle ID
-    async fn next_handle(&self) -> String {
+    /// Generate next handle ID, refusing when the session is at its handle limit.
+    async fn next_handle(&self) -> Result<String, String> {
+        if self.handles.lock().await.len() >= MAX_OPEN_HANDLES {
+            return Err(format!(
+                "Too many open handles (limit {})",
+                MAX_OPEN_HANDLES
+            ));
+        }
+
         let mut counter = self.handle_counter.lock().await;
         *counter += 1;
         format!("handle_{}", *counter)
@@ -153,7 +167,7 @@ impl SftpProtocol {
         };
         
         // Create handle
-        let handle_id = self.next_handle().await;
+        let handle_id = self.next_handle().await?;
         let handle = SftpHandle {
             path: resolved_path,
             file: Some(file),
@@ -236,6 +250,14 @@ impl SftpProtocol {
         
         tracing::debug!("SFTP OPENDIR: {:?}", resolved_path);
         
+        // Refuse before reading entries: OPENDIR retains them all in memory.
+        if self.handles.lock().await.len() >= MAX_OPEN_HANDLES {
+            return Err(format!(
+                "Too many open handles (limit {})",
+                MAX_OPEN_HANDLES
+            ));
+        }
+
         // Read directory entries
         let mut dir = fs::read_dir(&resolved_path).await
             .map_err(|e| format!("Failed to open directory: {}", e))?;
@@ -247,7 +269,7 @@ impl SftpProtocol {
         }
         
         // Create handle
-        let handle_id = self.next_handle().await;
+        let handle_id = self.next_handle().await?;
         let handle = SftpHandle {
             path: resolved_path,
             file: None,

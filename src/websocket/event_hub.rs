@@ -187,21 +187,21 @@ impl EventHub {
         self.active_containers.insert(internal_id.to_string(), true);
     }
     
-    /// Mark a container as inactive (should be called when container is deleted)
+    /// Mark a container as no longer streaming.
+    ///
+    /// Deliberately does NOT remove the channel: several clients can be connected to
+    /// one container, and tearing the channel down when one disconnects would break
+    /// the others. Channel teardown belongs to container deletion — see
+    /// `cleanup_inactive_channels`.
     pub async fn mark_container_inactive(&self, internal_id: &str) {
         self.active_containers.remove(internal_id);
-        
-        // Clean up the event channel
-        self.channels.remove(internal_id);
-        
-        tracing::info!("Cleaned up WebSocket channel for container: {}", internal_id);
     }
-    
+
     /// Check if container is active
     pub fn is_container_active(&self, internal_id: &str) -> bool {
         self.active_containers.contains_key(internal_id)
     }
-    
+
     /// Get or create a channel for a container
     pub fn get_or_create_channel(
         &self,
@@ -225,14 +225,7 @@ impl EventHub {
         self.channels.get(internal_id).map(|c| c.clone())
     }
     
-    /// Remove a channel (for manual cleanup)
-    #[allow(unused)]
-    pub fn remove_channel(&self, internal_id: &str) {
-        self.channels.remove(internal_id);
-    }
-    
     /// Clean up all inactive channels
-    #[allow(unused)]
     pub fn cleanup_inactive_channels(&self, active_ids: &[String]) {
         let active_set: std::collections::HashSet<String> = active_ids.iter().cloned().collect();
         self.channels.retain(|id, _| active_set.contains(id));

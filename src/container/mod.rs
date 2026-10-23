@@ -5,3 +5,4 @@ pub mod power;
 pub mod network;
 pub mod update;
 pub mod user;
+pub mod validation;

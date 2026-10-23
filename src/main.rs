@@ -149,6 +149,11 @@ async fn main_app(timer: Timer) {
     let firewall_db_path = format!("{}/firewall.db", config.storage.base_path);
     let firewall_manager = Arc::new(network::firewall::FirewallManager::new(&firewall_db_path)
         .expect("Failed to initialize firewall manager"));
+
+    // iptables rules do not survive a restart, but the database still records them
+    // as enabled. Re-apply before serving traffic so the API does not report rules
+    // as active that no packet matches.
+    firewall_manager.reapply_persisted_rules().await;
     
     // Initialize container manager
     let containers_db_path = format!("{}/containers.db", config.storage.base_path);
@@ -242,6 +247,36 @@ async fn main_app(timer: Timer) {
     
     // Initialize WebSocket event hub
     let event_hub = Arc::new(websocket::EventHub::new());
+
+    // Reap event channels for containers that no longer exist.
+    //
+    // Each channel retains a 1024-event broadcast buffer plus a log buffer, and
+    // nothing released them when a container was deleted, so every container ever
+    // created leaked one for the process lifetime. This reconciles rather than
+    // hooking the delete path, so it also cleans up channels left by any other
+    // removal route.
+    {
+        let hub = event_hub.clone();
+        let manager = container_manager.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(120));
+            loop {
+                tick.tick().await;
+                match manager.list_containers().await {
+                    Ok(containers) => {
+                        let live: Vec<String> =
+                            containers.into_iter().map(|c| c.internal_id).collect();
+                        hub.cleanup_inactive_channels(&live);
+                    }
+                    Err(e) => {
+                        // Do not reap on a failed listing: without a reliable view of
+                        // what exists, cleanup would drop channels for live containers.
+                        tracing::warn!("Skipping WebSocket channel cleanup: {}", e);
+                    }
+                }
+            }
+        });
+    }
     
     // Initialize console streamer
     let console_streamer = Arc::new(websocket::ConsoleStreamer::new(
@@ -410,12 +445,11 @@ async fn main_app(timer: Timer) {
         console_streamer,
         stats_collector,
         token_manager: token_manager.clone(),
+        api_token: config.authorization.token.clone(),
     };
     
     // Setup routers
     let public_routes = router::public::public_router();
-    let auth_routes = router::auth::auth_router(token_manager.clone());
-    let remote_routes = router::remote::remote_router();
     let firewall_routes = router::firewall::firewall_router(firewall_manager);
     let billing_routes = router::billing::billing_router(billing_tracker);
     
@@ -430,16 +464,33 @@ async fn main_app(timer: Timer) {
     );
     
     // Create auth config for middleware
-    let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config));
-    
+    let auth_config = Arc::new(auth::middleware::AuthConfig::from_config(&config, token_manager.clone()));
+
+    // Tokens are minted only by an authenticated caller. Previously this router was
+    // mounted bare, so any unauthenticated client could mint a token and then satisfy
+    // the WebSocket token check — bypassing the API gate entirely.
+    let auth_routes = router::auth::auth_router(token_manager.clone())
+        .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+    // Config read/reload is administrative; it was mounted bare and leaked the
+    // master bearer token in its response.
+    let remote_routes = router::remote::remote_router()
+        .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+
     // Protected routes with auth middleware
     let filesystem_routes = router::filesystem::volume_router(volume_handler)
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
+    // Port pool / firewall / billing act on host-wide infrastructure with no
+    // per-owner mapping, so they require an admin token. require_admin_middleware
+    // is layered before auth_middleware because the last layer added runs first:
+    // auth must run first so the Principal exists when require_admin inspects it.
     let network_routes = router::network::network_router(network_pool.clone())
+        .layer(middleware::from_fn(auth::middleware::require_admin_middleware))
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let firewall_protected_routes = firewall_routes
+        .layer(middleware::from_fn(auth::middleware::require_admin_middleware))
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let billing_protected_routes = billing_routes
+        .layer(middleware::from_fn(auth::middleware::require_admin_middleware))
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     let sftp_protected_routes = sftp_routes
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
@@ -447,24 +498,39 @@ async fn main_app(timer: Timer) {
         .layer(middleware::from_fn_with_state(auth_config.clone(), auth::middleware::auth_middleware));
     
     // WebSocket route
+    //
+    // The handler authenticates from a query token during the upgrade, so it cannot
+    // run auth_middleware. Handlers under this router still need a Principal to
+    // authorize against, so inject the admin identity here — see
+    // admin_principal_middleware, which documents why this is safe *only* for a
+    // router that authenticates its own requests.
     let ws_routes = Router::new()
         .route("/ws/:id", get(websocket::ws_handler))
-        .with_state(ws_state);
+        .with_state(ws_state)
+        .layer(middleware::from_fn(auth::middleware::admin_principal_middleware));
     
     // Build CORS layer based on allowed origins from config
-    let cors_layer = if config.authorization.allowed_origins.contains(&"*".to_string()) {
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any)
-    } else {
+    // Wildcard origins combined with credentials are not emitted: an invalid origin
+    // string in config is skipped with a warning rather than panicking the daemon.
+    let cors_layer = {
         let mut cors = CorsLayer::new();
+        let mut wildcard = false;
         for origin in &config.authorization.allowed_origins {
             if origin == "*" {
-                cors = cors.allow_origin(Any);
+                wildcard = true;
             } else {
-                cors = cors.allow_origin(origin.parse::<HeaderValue>().unwrap());
+                match origin.parse::<HeaderValue>() {
+                    Ok(value) => cors = cors.allow_origin(value),
+                    Err(_) => tracing::warn!("Ignoring invalid CORS origin in config: {:?}", origin),
+                }
             }
+        }
+        if wildcard {
+            tracing::warn!(
+                "allowed_origins contains \"*\": any website can call this API from a browser. \
+                 Restrict it to your dashboard origin."
+            );
+            cors = cors.allow_origin(Any);
         }
         cors.allow_methods(Any).allow_headers(Any)
     };
@@ -493,8 +559,15 @@ async fn main_app(timer: Timer) {
    // println!("Server running on http://{}", addr);
     //println!("WebSocket endpoint: ws://{}/ws/<container_id>", addr);
     
-    axum::serve(listener, app).await
-        .expect("Server failed");
+    // Serve with connect info so the auth middleware can attribute failed attempts
+    // to a peer address. Without this, ConnectInfo is never populated and the rate
+    // limit silently never triggers.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("Server failed");
 }
    
 

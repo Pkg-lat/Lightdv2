@@ -9,7 +9,7 @@ Tokens must follow this format:
 lightd_<random-string>
 ```
 
-Example: `lightd_ad2f7fc49ed640429c450e14ed07c8d5`
+Example: `lightd_your_token_here`
 
 ## Required Headers
 
@@ -30,7 +30,7 @@ Accept: Application/vnd.pkglatv1+json
 
 **Output:**
 ```
-Current Token: lightd_ad2f7fc49ed640429c450e14ed07c8d5
+Current Token: lightd_your_token_here
 ```
 
 ### Generate New Random Token
@@ -72,7 +72,7 @@ Tokens are stored in `config.json`:
 {
   "authorization": {
     "enabled": true,
-    "token": "lightd_ad2f7fc49ed640429c450e14ed07c8d5"
+    "token": "lightd_your_token_here"
   }
 }
 ```
@@ -135,17 +135,45 @@ Tokens are validated on every request:
 
 Expired tokens are automatically cleaned up every 5 minutes by the daemon.
 
+## Ownership and Scoping
+
+Every resource (container, volume, port) belongs to an **owner**.
+
+- The master token in `config.json` (or `LIGHTD_API_TOKEN`) acts as an **admin**:
+  it can see and control everything.
+- A token minted through `POST /auth/tokens` acts as the `owner` it was issued
+  for, and can only act on containers belonging to that owner.
+- `POST /auth/tokens` requires an admin token. A tenant token cannot mint tokens.
+- The owner of a container is taken from the authenticated token at creation and
+  is never read from the request body.
+- Cross-owner access returns `404`, not `403`, so a tenant cannot use the response
+  to discover which container ids exist.
+
+Containers created before the ownership model existed have no owner recorded.
+They are treated as admin-only rather than shared, so assign an owner before
+expecting a tenant to reach them.
+
+## Rate Limiting
+
+Failed authentication attempts are limited per peer IP (20 per minute). Only
+failures count, so a correctly authenticated client is never throttled.
+
 ## Public Routes (No Auth Required)
 
 These routes don't require authentication:
 
 - `GET /api/v1/public/ping` - Health check
 
+`/auth/tokens` and `/remote/config` are **not** public. Both previously were:
+`/auth/tokens` let anyone mint a token, and `/remote/config` returned the master
+token in its response body. Both now require authentication, and `/remote/config`
+serves a redacted view containing no secrets.
+
 ## Example Authenticated Request
 
 ```bash
 curl -X GET http://localhost:8070/volumes \
-  -H "Authorization: Bearer lightd_ad2f7fc49ed640429c450e14ed07c8d5" \
+  -H "Authorization: Bearer lightd_your_token_here" \
   -H "Accept: Application/vnd.pkglatv1+json"
 ```
 

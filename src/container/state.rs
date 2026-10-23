@@ -24,6 +24,14 @@ pub struct ContainerState {
     /// Pattern to detect when server is fully started (string or regex)
     #[serde(default)]
     pub start_pattern: Option<String>,
+    /// Owner this container belongs to. Only the owner (or an admin) may act on it.
+    ///
+    /// `#[serde(default)]` keeps rows written before ownership existed
+    /// deserializable. Those rows default to an empty owner, which no tenant
+    /// matches, so they are effectively admin-only — fail-closed rather than
+    /// silently shared.
+    #[serde(default)]
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +70,7 @@ impl ContainerState {
         internal_id: String,
         volume_id: String,
         startup_command: String,
+        owner: String,
     ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -92,6 +101,7 @@ impl ContainerState {
             created_at: now,
             updated_at: now,
             start_pattern: None,
+            owner,
         }
     }
 

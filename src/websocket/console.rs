@@ -77,6 +77,10 @@ impl ConsoleStreamer {
         if let Some((_, handle)) = self.active_tasks.remove(internal_id) {
             handle.abort();
         }
+
+        // Clear the active flag so the stdin and log tasks that poll
+        // is_container_active() observe the cancellation and exit.
+        self.event_hub.mark_container_inactive(internal_id).await;
         
         // Update state to offline
         if let Some(channel) = self.event_hub.get_channel(internal_id) {
@@ -107,6 +111,14 @@ impl ConsoleStreamer {
         // Clone internal_id for the closure
         let internal_id_for_check = internal_id_clone.clone();
         
+        // Mark active before the tasks below start polling it.
+        //
+        // Nothing ever set this flag, so `is_container_active` always returned false
+        // and the stdin task's own cancellation check fired immediately: the task
+        // exited after at most one extra Docker attach, leaking a task and an attach
+        // per connection instead of tracking the connection's lifetime.
+        event_hub.mark_container_active(&internal_id);
+
         // Wrap cancellation check in Arc for thread safety
         let is_cancelled = Arc::new(move || !event_hub_check.is_container_active(&internal_id_for_check));
         
@@ -156,6 +168,7 @@ impl ConsoleStreamer {
         let internal_id_input = internal_id.clone();
         let is_cancelled_stdin = is_cancelled.clone();
         
+        // Pulled out of the streaming task's scope so stop_streaming() can abort it.
         let _stdin_task = tokio::spawn(async move {
             loop {
                 // Check if cancelled

@@ -254,6 +254,7 @@
             <div class="section">
                 <div class="section-title">Container Setup</div>
                 <input type="text" id="containerId" placeholder="Container ID" value="ws-test-001">
+                <input type="text" id="wsToken" placeholder="API token (lightd_...)" style="width:22rem">
                 <input type="text" id="dockerImage" placeholder="Docker Image" value="alpine:latest">
                 <button onclick="createAndConnect()">Create & Connect</button>
                 <button onclick="deleteContainer()" class="danger">Delete Container</button>
@@ -372,10 +373,19 @@
                 log('No container ID', 'error');
                 return;
             }
+
+            // The upgrade authenticates from a query-parameter token: the server
+            // requires it and 401s without one. Read it here rather than hardcoding,
+            // so no credential ends up committed in this file.
+            const wsToken = document.getElementById('wsToken').value.trim();
+            if (!wsToken) {
+                log('No API token — the WebSocket upgrade requires one', 'error');
+                return;
+            }
             
             if (ws) ws.close();
             
-            ws = new WebSocket(`ws://localhost:8070/ws/${containerId}`);
+            ws = new WebSocket(`ws://localhost:8070/ws/${containerId}?token=${encodeURIComponent(wsToken)}`);
             
             ws.onopen = () => {
                 updateStatus('online', 'Connected');

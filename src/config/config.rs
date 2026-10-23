@@ -43,8 +43,14 @@ pub struct AuthConfig {
     pub allowed_origins: Vec<String>,
 }
 
+/// Default to no browser origins rather than `*`.
+///
+/// An empty list denies any request that carries an `Origin` header (i.e. browser
+/// JS) while still allowing non-browser clients such as curl and the SDK. Set
+/// `authorization.allowed_origins` explicitly to the dashboard's origin to allow
+/// a browser UI. Defaulting to `*` let any site call the API with a leaked token.
 fn default_origins() -> Vec<String> {
-    vec!["*".to_string()]
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -8,9 +8,12 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use axum::Extension;
 use std::sync::Arc;
 
+use crate::auth::principal::Principal;
 use crate::container::manager::ContainerManager;
+use crate::container::validation::validate_identifier;
 use crate::sftp::credentials::CredentialsManager;
 
 #[derive(Clone)]
@@ -75,9 +78,14 @@ pub fn sftp_router(
 /// Generate or reset SFTP credentials for a container
 async fn generate_credentials(
     State(state): State<SftpState>,
+    Extension(principal): Extension<Principal>,
     Path(container_id): Path<String>,
     Json(payload): Json<GenerateCredentialsRequest>,
 ) -> Response {
+    if let Err(e) = validate_identifier("container id", &container_id) {
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
+    }
+
     // Get container to verify it exists and get volume_id
     let container = match state.container_manager.get_container(&container_id).await {
         Ok(Some(c)) => c,
@@ -98,7 +106,18 @@ async fn generate_credentials(
             ).into_response();
         }
     };
-    
+
+    // Ownership gate. Any token could previously generate or reset SFTP
+    // credentials for any container, which grants filesystem access to its volume.
+    if !principal.can_access(&container) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Container not found".to_string(),
+            }),
+        ).into_response();
+    }
+
     // Generate credentials
     match state.credentials_manager.generate_credentials(
         &container_id,
@@ -131,8 +150,26 @@ async fn generate_credentials(
 /// Get SFTP connection info for a container
 async fn get_sftp_info(
     State(state): State<SftpState>,
+    Extension(principal): Extension<Principal>,
     Path(container_id): Path<String>,
 ) -> Response {
+    if let Err(e) = validate_identifier("container id", &container_id) {
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
+    }
+
+    // Ownership gate — as above, this would otherwise disclose credentials.
+    match state.container_manager.get_container(&container_id).await {
+        Ok(Some(container)) if principal.can_access(&container) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Container not found".to_string(),
+                }),
+            ).into_response();
+        }
+    }
+
     // Get credentials
     match state.credentials_manager.get_credentials(&container_id) {
         Ok(Some(creds)) => {

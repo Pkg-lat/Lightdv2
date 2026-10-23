@@ -77,7 +77,7 @@ pub async fn list_servers(page: i64) {
         
         let container_id_display = container.container_id
             .as_ref()
-            .map(|id| if id.len() > 12 { &id[..12] } else { id })
+            .map(|id| if id.len() > 12 { &id[..id.floor_char_boundary(12)] } else { id })
             .unwrap_or("N/A");
         
         // Format creation time
@@ -153,11 +153,20 @@ fn format_timestamp(ts: u64) -> String {
     }
 }
 
-/// Truncate a string to a maximum length
+/// Truncate a string to a maximum length.
+///
+/// Slicing by byte index panics when the index lands inside a multi-byte
+/// character ("byte index N is not a char boundary"), which an internal_id
+/// containing non-ASCII input reaches. `floor_char_boundary` clamps to the
+/// nearest boundary at or below the index instead.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
+    if s.chars().count() <= max_len {
+        return s.to_string();
     }
+
+    // Account for the ellipsis, but never underflow on a tiny max_len.
+    let keep = max_len.saturating_sub(3);
+    let end = s.floor_char_boundary(keep.min(s.len()));
+
+    format!("{}...", &s[..end])
 }
